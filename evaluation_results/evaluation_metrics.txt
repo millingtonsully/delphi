@@ -1,0 +1,18 @@
+DELPHI Model Evaluation Results
+==================================================
+
+Model: checkpoints/delphi_final.pt
+Series evaluated: 100
+Forecast horizon: 26
+Context length: 52
+
+Metrics:
+--------------------------------------------------
+  MASE                : 3.7258
+  OWA                 : 12.5711
+  MAE                 : 0.0135
+  RMSE                : 0.0149
+  PDA                 : 0.5285
+  COVERAGE            : 0.7738
+  EXPECTED_COVERAGE   : 0.9500
+  CALIBRATION_ERROR   : 0.1762
