@@ -4,18 +4,13 @@ torchvision>=0.15.0
 torchaudio>=2.0.0
 
 # Time series and forecasting
-neuralforecast>=1.6.0  # For PatchTST, N-BEATS, N-HiTS
-gluonts>=0.14.0  # For ETS/SNAIVE meta-ensemble members
 statsmodels>=0.14.0
 tbats>=1.1.3
-chronos-forecast>=0.1.0  # For Chronos-2 foundation model
-hierarchicalforecast>=0.7.0  # For MinT reconciliation
 
 # Data processing
 pandas>=2.0.0
 numpy>=1.24.0
 scikit-learn>=1.3.0
-xgboost>=2.0.0
 
 # Visualization and utilities
 matplotlib>=3.7.0
@@ -26,4 +21,5 @@ tqdm>=4.65.0
 pyyaml>=6.0
 tensorboard>=2.13.0
 
-
+# xLSTM for enhanced time series modeling
+git+https://github.com/muslehal/xLSTMTime.git

@@ -14,9 +14,11 @@ from .ensemble_correctors import DeepEnsembleCorrectors
 class DELPHICore(nn.Module):
     """
     Core DELPHI model combining:
-    - Variational HMM gating for regime detection
-    - Deep ensemble of specialized RNN correctors
+    - Variational HMM gating for regime detection (xLSTM-based)
+    - Deep ensemble of specialized xLSTM correctors
     - Probabilistic uncertainty quantification
+    
+    All components use xLSTM with exponential gating for enhanced long-term memory.
     """
     
     def __init__(
@@ -29,8 +31,7 @@ class DELPHICore(nn.Module):
         ensemble_num_layers: int = 2,
         output_dim: int = 26,  # Forecast horizon
         n_ensemble_members: int = 5,
-        dropout: float = 0.2,
-        use_xlstm_for_trend: bool = False
+        dropout: float = 0.2
     ):
         """
         Initialize DELPHI core model.
@@ -38,14 +39,13 @@ class DELPHICore(nn.Module):
         Args:
             input_dim: Input feature dimension
             n_states: Number of HMM latent states
-            hmm_hidden_size: HMM LSTM hidden size
-            hmm_num_layers: HMM LSTM layers
-            ensemble_hidden_size: Ensemble LSTM hidden size
-            ensemble_num_layers: Ensemble LSTM layers
+            hmm_hidden_size: HMM xLSTM hidden size
+            hmm_num_layers: HMM xLSTM layers
+            ensemble_hidden_size: Ensemble xLSTM hidden size
+            ensemble_num_layers: Ensemble xLSTM layers
             output_dim: Forecast horizon
             n_ensemble_members: Number of ensemble members (M=5)
             dropout: Dropout rate
-            use_xlstm_for_trend: Whether to use xLSTMTime for trend corrector
         """
         super().__init__()
         
@@ -53,7 +53,7 @@ class DELPHICore(nn.Module):
         self.n_states = n_states
         self.output_dim = output_dim
         
-        # Variational HMM Gating
+        # Variational HMM Gating (xLSTM-based)
         self.hmm_gating = VariationalHMMGating(
             input_dim=input_dim,
             n_states=n_states,
@@ -62,15 +62,14 @@ class DELPHICore(nn.Module):
             dropout=dropout
         )
         
-        # Deep Ensemble Correctors
+        # Deep Ensemble Correctors (xLSTM-based)
         self.ensemble = DeepEnsembleCorrectors(
             input_dim=input_dim,
             hidden_size=ensemble_hidden_size,
             num_layers=ensemble_num_layers,
             output_dim=output_dim,
             dropout=dropout,
-            n_members=n_ensemble_members,
-            use_xlstm_for_trend=use_xlstm_for_trend
+            n_members=n_ensemble_members
         )
     
     def forward(
@@ -96,12 +95,17 @@ class DELPHICore(nn.Module):
         """
         batch_size = x.shape[0]
         
-        # Get HMM state probabilities (posterior)
+        # Get HMM state probabilities (posterior for training)
         state_probs = self.hmm_gating(x, mode='posterior')
         
-        # Sample states for routing
-        states = torch.multinomial(state_probs, 1).squeeze(-1)  # (batch,)
-        states_expanded = states.unsqueeze(1).expand(-1, x.shape[1])  # (batch, seq_len)
+        if self.training:
+            # Training: sample single state from posterior
+            states = torch.multinomial(state_probs, 1).squeeze(-1)  # (batch,)
+            states_expanded = states.unsqueeze(1).expand(-1, x.shape[1])  # (batch, seq_len)
+        else:
+            # Inference: use per-timestep trajectory sampling via Markov chain
+            states_expanded = self.hmm_gating(x, mode='prior')  # (batch, seq_len)
+            states = states_expanded[:, -1]  # Last timestep state for return
         
         # Get correction from ensemble with state-based routing
         correction = self.ensemble(x, states=states_expanded)
@@ -131,57 +135,49 @@ class DELPHICore(nn.Module):
         num_samples: int = 100
     ) -> Dict[str, torch.Tensor]:
         """
-        Predict with uncertainty quantification via HMM trajectory sampling.
+        Generate predictions with uncertainty via HMM trajectory sampling.
         
         Args:
             x: Input tensor of shape (batch, seq_len, input_dim)
             parametric_forecast: Parametric baseline forecast (batch, output_dim)
-            num_samples: Number of HMM trajectory samples
+            num_samples: Number of trajectory samples for uncertainty estimation
         
         Returns:
             Dictionary with:
                 - 'mean': Mean forecast (batch, output_dim)
                 - 'std': Standard deviation (batch, output_dim)
-                - 'forecasts': All sampled forecasts (num_samples, batch, output_dim)
-                - 'confidence_intervals': 95% CI (batch, output_dim, 2)
+                - 'lower_95': Lower 95% confidence bound (batch, output_dim)
+                - 'upper_95': Upper 95% confidence bound (batch, output_dim)
+                - 'samples': All samples (num_samples, batch, output_dim)
         """
-        # Sample HMM trajectories
-        trajectories = self.hmm_gating.sample_trajectories(x, num_samples)
-        # trajectories: (num_samples, batch, seq_len)
+        self.eval()
+        preds = []
         
-        # Get ensemble uncertainty
-        mean_correction, std_correction = self.ensemble.forward_with_uncertainty(x, num_samples)
+        with torch.no_grad():
+            for _ in range(num_samples):
+                # Sample per-timestep trajectory via Markov chain
+                states = self.hmm_gating(x, mode='prior')  # (batch, seq_len)
+                correction = self.ensemble(x, states=states)
+                
+                if parametric_forecast is not None:
+                    pred = parametric_forecast + correction
+                else:
+                    pred = correction
+                preds.append(pred)
         
-        # Sample corrections for each trajectory
-        forecasts = []
-        for i in range(num_samples):
-            traj = trajectories[i]  # (batch, seq_len)
-            # Use trajectory to route ensemble
-            correction = self.ensemble(x, states=traj)
-            
-            if parametric_forecast is not None:
-                forecast = parametric_forecast + correction
-            else:
-                forecast = correction
-            
-            forecasts.append(forecast)
-        
-        forecasts = torch.stack(forecasts, dim=0)  # (num_samples, batch, output_dim)
+        # Stack samples: (num_samples, batch, output_dim)
+        preds = torch.stack(preds, dim=0)
         
         # Compute statistics
-        mean_forecast = forecasts.mean(dim=0)
-        std_forecast = forecasts.std(dim=0)
-        
-        # 95% confidence intervals
-        lower = mean_forecast - 1.96 * std_forecast
-        upper = mean_forecast + 1.96 * std_forecast
-        confidence_intervals = torch.stack([lower, upper], dim=-1)  # (batch, output_dim, 2)
+        mean = preds.mean(dim=0)
+        std = preds.std(dim=0)
         
         return {
-            'mean': mean_forecast,
-            'std': std_forecast,
-            'forecasts': forecasts,
-            'confidence_intervals': confidence_intervals
+            'mean': mean,
+            'std': std,
+            'lower_95': mean - 1.96 * std,
+            'upper_95': mean + 1.96 * std,
+            'samples': preds
         }
     
     def get_regime_explanation(

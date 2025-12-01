@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from typing import Tuple, Optional, Dict
 import numpy as np
 
+from .xlstm_layer import xLSTM
+
 
 class VariationalHMMGating(nn.Module):
     """
@@ -16,6 +18,7 @@ class VariationalHMMGating(nn.Module):
     
     Models temporal regime persistence via Markov chains with variational
     posterior for tractable inference. Supports two-stage ELBO training.
+    Uses xLSTM with exponential gating for enhanced long-term memory.
     """
     
     def __init__(
@@ -32,8 +35,8 @@ class VariationalHMMGating(nn.Module):
         Args:
             input_dim: Dimension of input features
             n_states: Number of latent discrete states
-            hidden_size: Hidden size for LSTM layers
-            num_layers: Number of LSTM layers
+            hidden_size: Hidden size for xLSTM layers
+            num_layers: Number of xLSTM layers
             dropout: Dropout rate
         """
         super().__init__()
@@ -42,22 +45,22 @@ class VariationalHMMGating(nn.Module):
         self.n_states = n_states
         self.hidden_size = hidden_size
         
-        # Initial state LSTM (for prior)
-        self.initial_lstm = nn.LSTM(
+        # Initial state xLSTM (for prior)
+        self.initial_xlstm = xLSTM(
             input_dim, hidden_size, num_layers, 
             batch_first=True, dropout=dropout if num_layers > 1 else 0
         )
         self.fc_initial = nn.Linear(hidden_size, n_states)
         
-        # Transition LSTM (for prior)
-        self.transition_lstm = nn.LSTM(
+        # Transition xLSTM (for prior)
+        self.transition_xlstm = xLSTM(
             input_dim + n_states, hidden_size, num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0
         )
         self.fc_trans = nn.Linear(hidden_size, n_states * n_states)
         
-        # Posterior LSTM
-        self.posterior_lstm = nn.LSTM(
+        # Posterior xLSTM
+        self.posterior_xlstm = xLSTM(
             input_dim, hidden_size, num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0
         )
@@ -84,7 +87,7 @@ class VariationalHMMGating(nn.Module):
         
         if mode == 'posterior':
             # Variational posterior: q(z|x)
-            out, _ = self.posterior_lstm(x)
+            out, _ = self.posterior_xlstm(x)
             out = self.dropout(out)
             # Average over sequence for global posterior
             logits = self.fc_posterior(out.mean(dim=1))
@@ -96,7 +99,7 @@ class VariationalHMMGating(nn.Module):
             trajectories = []
             
             # Initial state
-            init_out, _ = self.initial_lstm(x[:, :1, :])
+            init_out, _ = self.initial_xlstm(x[:, :1, :])
             init_logits = self.fc_initial(self.dropout(init_out.squeeze(1)))
             init_probs = F.softmax(init_logits, dim=-1)
             
@@ -116,7 +119,7 @@ class VariationalHMMGating(nn.Module):
                 ], dim=-1)
                 
                 # Get transition probabilities
-                trans_out, _ = self.transition_lstm(trans_input)
+                trans_out, _ = self.transition_xlstm(trans_input)
                 trans_logits = self.fc_trans(self.dropout(trans_out.squeeze(1)))
                 trans_matrix = F.softmax(
                     trans_logits.view(-1, self.n_states, self.n_states), 
@@ -139,29 +142,6 @@ class VariationalHMMGating(nn.Module):
         else:
             raise ValueError(f"Unknown mode: {mode}. Use 'posterior' or 'prior'")
     
-    def sample_trajectories(
-        self,
-        x: torch.Tensor,
-        num_samples: int = 100
-    ) -> torch.Tensor:
-        """
-        Sample multiple HMM trajectories for uncertainty quantification.
-        
-        Args:
-            x: Input tensor of shape (batch, seq_len, input_dim)
-            num_samples: Number of trajectory samples
-        
-        Returns:
-            Sampled trajectories of shape (num_samples, batch, seq_len)
-        """
-        trajectories = []
-        
-        for _ in range(num_samples):
-            traj = self.forward(x, mode='prior')
-            trajectories.append(traj)
-        
-        return torch.stack(trajectories, dim=0)
-    
     def get_state_probs(self, x: torch.Tensor) -> torch.Tensor:
         """Get posterior state probabilities."""
         return self.forward(x, mode='posterior')
@@ -180,14 +160,14 @@ class VariationalHMMGating(nn.Module):
         seq_len = x.shape[1]
         
         # Use first timestep for initial state
-        init_out, _ = self.initial_lstm(x[:, :1, :])
+        init_out, _ = self.initial_xlstm(x[:, :1, :])
         init_probs = F.softmax(self.fc_initial(self.dropout(init_out.squeeze(1))), dim=-1)
         
         # Get transition matrix from middle timestep
         mid_idx = seq_len // 2
         prev_onehot = F.one_hot(torch.argmax(init_probs, dim=-1), self.n_states).float()
         trans_input = torch.cat([x[:, mid_idx:mid_idx+1, :], prev_onehot.unsqueeze(1)], dim=-1)
-        trans_out, _ = self.transition_lstm(trans_input)
+        trans_out, _ = self.transition_xlstm(trans_input)
         trans_logits = self.fc_trans(self.dropout(trans_out.squeeze(1)))
         trans_matrix = F.softmax(trans_logits.view(-1, self.n_states, self.n_states), dim=-1)
         

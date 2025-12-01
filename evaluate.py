@@ -14,10 +14,10 @@ from pathlib import Path
 import os
 from typing import Any, Union, Optional, Dict
 
-from delphi.inference.predictor import DELPHIPredictor
 from delphi.models.delphi_core import DELPHICore
 from delphi.models.parametric import TBATSBaseline
 from delphi.data import HERMESDataLoader, preprocess_hermes_data
+from delphi.data.preprocessing import prepare_model_inputs
 from delphi.evaluation.metrics import compute_all_metrics
 
 
@@ -35,6 +35,78 @@ def _ensure_numeric(
         return float(value)
     except (ValueError, TypeError):
         return default if default is not None else 0
+
+
+def load_model(checkpoint_path: str, model_config: Dict, device: str) -> DELPHICore:
+    """
+    Load DELPHI model from checkpoint.
+    
+    Args:
+        checkpoint_path: Path to model checkpoint
+        model_config: Model configuration dictionary
+        device: Device for inference
+    
+    Returns:
+        Loaded model in eval mode
+    """
+    model = DELPHICore(**model_config)
+    checkpoint = torch.load(
+        checkpoint_path, 
+        map_location=torch.device(device),
+        weights_only=False
+    )
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+    model.eval()
+    return model
+
+
+def predict_series(
+    model: DELPHICore,
+    device: str,
+    main_signal: np.ndarray,
+    residuals: Optional[np.ndarray] = None,
+    weak_signal_ratio: Optional[np.ndarray] = None,
+    parametric_forecast: Optional[np.ndarray] = None
+) -> Dict[str, np.ndarray]:
+    """
+    Generate prediction for a single time series.
+    
+    Args:
+        model: DELPHI model
+        device: Device for inference
+        main_signal: Main time series signal
+        residuals: TBATS residuals (z_t = y_t - ŷ_t)
+        weak_signal_ratio: Weak signal ratio
+        parametric_forecast: Parametric baseline forecast
+    
+    Returns:
+        Dictionary with forecast results
+    """
+    # Prepare input tensor
+    input_tensor = prepare_model_inputs(
+        main_signal,
+        residuals=residuals,
+        weak_signal_ratio=weak_signal_ratio,
+        parametric_forecast=parametric_forecast
+    )
+    
+    # Add batch dimension and convert to torch tensor
+    inputs = torch.FloatTensor(input_tensor).unsqueeze(0).to(device)
+    
+    if parametric_forecast is not None:
+        param_tensor = torch.FloatTensor(parametric_forecast).unsqueeze(0).to(device)
+    else:
+        param_tensor = None
+    
+    # Run inference
+    with torch.no_grad():
+        results = model(inputs, parametric_forecast=param_tensor)
+        return {
+            'forecast': results['forecast'].cpu().numpy(),
+            'correction': results['correction'].cpu().numpy(),
+            'state_probs': results['state_probs'].cpu().numpy()
+        }
 
 
 def main():
@@ -63,7 +135,7 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Initialize model
+    # Initialize device
     device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     if device == 'cuda' and not torch.cuda.is_available():
         device = 'cpu'
@@ -77,18 +149,13 @@ def main():
         'ensemble_num_layers': config['ensemble']['num_layers'],
         'output_dim': forecast_horizon,
         'n_ensemble_members': config['ensemble']['n_members'],
-        'dropout': config['hmm']['dropout'],
-        'use_xlstm_for_trend': config['ensemble'].get('use_xlstm_for_trend', False)
+        'dropout': config['hmm']['dropout']
     }
     
-    # Load predictor
+    # Load model
     print("Loading DELPHI model...")
     print(f"  Device: {device}")
-    predictor = DELPHIPredictor.from_checkpoint(
-        args.model_path,
-        model_config,
-        device=device
-    )
+    model = load_model(args.model_path, model_config, device)
     print("  Model loaded successfully!")
     
     # Load data
@@ -139,7 +206,7 @@ def main():
     
     # Use all data except last forecast_horizon for TBATS fitting
     tbats_input = {sid: main_signals[sid][:-forecast_horizon] for sid in eval_series}
-    param_forecasts, _ = tbats.fit_and_forecast(
+    param_forecasts, param_residuals = tbats.fit_and_forecast(
         tbats_input,
         forecast_horizon=forecast_horizon,
         verbose=False
@@ -148,16 +215,14 @@ def main():
     # Run evaluation
     print("\nRunning DELPHI predictions...")
     predictions = {}
-    uncertainties = {}
     true_values = {}
     train_data = {}
-    
-    num_samples = _ensure_numeric(config.get('inference', {}).get('num_samples', 100), 100, 'int')
     
     for idx, series_id in enumerate(eval_series, 1):
         main_signal = main_signals[series_id]
         weak_ratio = weak_ratios.get(series_id)
         param_forecast = param_forecasts.get(series_id)
+        series_residuals = param_residuals.get(series_id)
         
         # Holdout: last forecast_horizon as test, previous context_length as input
         input_seq = main_signal[-(context_length + forecast_horizon):-forecast_horizon]
@@ -167,21 +232,27 @@ def main():
         true_values[series_id] = target_seq
         train_data[series_id] = main_signal[:-forecast_horizon]
         
+        # Get residuals for input context
+        input_residuals = None
+        if series_residuals is not None and len(series_residuals) >= context_length:
+            input_residuals = series_residuals[-context_length:]
+        
         # Get weak ratio for input if available
         input_weak_ratio = None
         if weak_ratio is not None and len(weak_ratio) >= context_length + forecast_horizon:
             input_weak_ratio = weak_ratio[-(context_length + forecast_horizon):-forecast_horizon]
         
         # Predict
-        result = predictor.predict_series(
+        result = predict_series(
+            model=model,
+            device=device,
             main_signal=input_seq,
+            residuals=input_residuals,
             weak_signal_ratio=input_weak_ratio,
-            parametric_forecast=param_forecast,
-            num_samples=num_samples
+            parametric_forecast=param_forecast
         )
         
-        predictions[series_id] = result['mean'].flatten()
-        uncertainties[series_id] = result['std'].flatten()
+        predictions[series_id] = result['forecast'].flatten()
         
         if idx % 20 == 0 or idx == len(eval_series):
             print(f"  Processed {idx}/{len(eval_series)} series")
@@ -194,9 +265,7 @@ def main():
     metrics = compute_all_metrics(
         y_true=true_values,
         y_pred=predictions,
-        y_train=train_data,
-        y_std=uncertainties,
-        confidence_level=config.get('inference', {}).get('confidence_level', 0.95)
+        y_train=train_data
     )
     
     # Print results
@@ -228,7 +297,6 @@ def main():
     for series_id in predictions.keys():
         pred = predictions[series_id]
         true = true_values[series_id]
-        std = uncertainties[series_id]
         
         for t in range(len(pred)):
             predictions_rows.append({
@@ -236,9 +304,6 @@ def main():
                 'horizon': t + 1,
                 'predicted': pred[t],
                 'actual': true[t],
-                'std': std[t],
-                'lower_95': pred[t] - 1.96 * std[t],
-                'upper_95': pred[t] + 1.96 * std[t],
                 'error': pred[t] - true[t],
                 'abs_error': abs(pred[t] - true[t])
             })
@@ -254,20 +319,20 @@ def main():
         pred = predictions[series_id]
         true = true_values[series_id]
         
-        mae = np.mean(np.abs(pred - true))
-        rmse = np.sqrt(np.mean((pred - true) ** 2))
+        mae_val = np.mean(np.abs(pred - true))
+        rmse_val = np.sqrt(np.mean((pred - true) ** 2))
         
         # Direction accuracy
         last_known = train_data[series_id][-1]
         true_dir = np.sign(true - last_known)
         pred_dir = np.sign(pred - last_known)
-        pda = np.mean(true_dir == pred_dir)
+        pda_val = np.mean(true_dir == pred_dir)
         
         summary_rows.append({
             'series_id': series_id,
-            'mae': mae,
-            'rmse': rmse,
-            'pda': pda
+            'mae': mae_val,
+            'rmse': rmse_val,
+            'pda': pda_val
         })
     
     summary_df = pd.DataFrame(summary_rows)

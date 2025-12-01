@@ -1,8 +1,12 @@
 """
 DELPHI model components.
+
+All models use xLSTM (Extended LSTM) with exponential gating for enhanced
+long-term memory and improved time series forecasting.
 """
 
 from .parametric import TBATSBaseline, fit_parametric_baseline
+from .xlstm_layer import xLSTM, xLSTMCell, xLSTMLayer
 from .hmm_gating import VariationalHMMGating
 from .ensemble_correctors import (
     EnsembleMember,
@@ -13,13 +17,13 @@ from .ensemble_correctors import (
     DeepEnsembleCorrectors
 )
 from .delphi_core import DELPHICore
-from .xlstm_time import xLSTMTimeModel
-from .meta_ensemble import MetaEnsemble
-from .reconciliation import MinTReconciliation
 
 __all__ = [
     'TBATSBaseline',
     'fit_parametric_baseline',
+    'xLSTM',
+    'xLSTMCell',
+    'xLSTMLayer',
     'VariationalHMMGating',
     'EnsembleMember',
     'TrendCorrectorRNN',
@@ -27,9 +31,6 @@ __all__ = [
     'VolatilityShiftCorrectorRNN',
     'ExternalSignalSpecialist',
     'DeepEnsembleCorrectors',
-    'DELPHICore',
-    'xLSTMTimeModel',
-    'MetaEnsemble',
-    'MinTReconciliation'
+    'DELPHICore'
 ]
 

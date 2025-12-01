@@ -20,10 +20,7 @@ from delphi.data import HERMESDataLoader, create_train_val_test_split, preproces
 from delphi.data.preprocessing import prepare_model_inputs
 from delphi.models.parametric import TBATSBaseline
 from delphi.models.delphi_core import DELPHICore
-from delphi.models import MetaEnsemble, MinTReconciliation
-from delphi.models.baselines import ETSModel, SNAIVEModel
 from delphi.training.trainer import DELPHITrainer, TimeSeriesDataset
-from delphi.inference.predictor import DELPHIPredictor
 from torch.utils.data import DataLoader
 
 
@@ -140,7 +137,7 @@ def _validate_and_convert_config(config: Dict) -> Dict:
     )
     
     config['ensemble']['n_members'] = _ensure_numeric(
-        config['ensemble']['n_members'], default=5, min_val=1, value_type='int'
+        config['ensemble']['n_members'], default=4, min_val=1, value_type='int'
     )
     config['ensemble']['hidden_size'] = _ensure_numeric(
         config['ensemble']['hidden_size'], default=64, min_val=1, value_type='int'
@@ -152,23 +149,12 @@ def _validate_and_convert_config(config: Dict) -> Dict:
         config['ensemble']['dropout'], default=0.2, min_val=0.0, max_val=1.0
     )
     
-    # Meta-ensemble config (if present)
-    if 'meta_ensemble' in config and 'meta_learner' in config['meta_ensemble']:
-        ml = config['meta_ensemble']['meta_learner']
-        ml['n_estimators'] = _ensure_numeric(ml.get('n_estimators', 100), default=100, min_val=1, value_type='int')
-        ml['max_depth'] = _ensure_numeric(ml.get('max_depth', 6), default=6, min_val=1, value_type='int')
-        ml['learning_rate'] = _ensure_numeric(ml.get('learning_rate', 0.1), default=0.1, min_val=1e-6)
-        ml['subsample'] = _ensure_numeric(ml.get('subsample', 0.8), default=0.8, min_val=0.1, max_val=1.0)
-        ml['colsample_bytree'] = _ensure_numeric(ml.get('colsample_bytree', 0.8), default=0.8, min_val=0.1, max_val=1.0)
-    
-    # Inference config (if present)
-    if 'inference' in config:
-        config['inference']['num_samples'] = _ensure_numeric(
-            config['inference'].get('num_samples', 100), default=100, min_val=1, value_type='int'
-        )
-        config['inference']['confidence_level'] = _ensure_numeric(
-            config['inference'].get('confidence_level', 0.95), default=0.95, min_val=0.5, max_val=0.99
-        )
+    # Inference config
+    if 'inference' not in config:
+        config['inference'] = {}
+    config['inference']['num_samples'] = _ensure_numeric(
+        config['inference'].get('num_samples', 100), default=100, min_val=1, value_type='int'
+    )
     
     # Validate logical constraints
     if config['data']['train_end_week'] >= config['data']['val_end_week']:
@@ -193,15 +179,8 @@ def prepare_data(config):
     # Load data
     loader = HERMESDataLoader(data_dir=config['data']['data_dir'])
     
-    if config['data']['use_synthetic_data'] or loader.get_series_count() == 0:
-        print("Using synthetic data...")
-        data = loader.create_synthetic_data(
-            n_series=config['data']['synthetic_n_series'],
-            length=config['data']['synthetic_length']
-        )
-    else:
-        print("Loading HERMES data...")
-        data = loader.load_all_series(load_weak_signal=True)
+    print("Loading HERMES data...")
+    data = loader.load_all_series(load_weak_signal=True)
     
     # Preprocess
     print("Preprocessing data (this may take a while for large datasets)...")
@@ -262,6 +241,7 @@ def prepare_datasets(splits, config):
         main_signal = splits['train']['main_signal'][series_id]
         weak_ratio = splits['train'].get('weak_signal_ratio', {}).get(series_id)
         param_forecast = train_forecasts.get(series_id)
+        series_residuals = train_residuals.get(series_id)
         
         if len(main_signal) < config['data']['forecast_horizon'] + 52:
             continue
@@ -272,20 +252,25 @@ def prepare_datasets(splits, config):
             input_seq = main_signal[i:i+seq_len]
             target_seq = main_signal[i+seq_len:i+seq_len+config['data']['forecast_horizon']]
             
-            # Prepare model input
-            param_seq = None
-            if weak_ratio is not None and param_forecast is not None:
-                weak_seq = weak_ratio[i:i+seq_len]
-                param_seq = param_forecast[:config['data']['forecast_horizon']]
-                input_tensor = prepare_model_inputs(
-                    input_seq, weak_signal_ratio=weak_seq, parametric_forecast=param_seq
-                )
-            else:
-                input_tensor = prepare_model_inputs(input_seq)
+            # Get residuals for this sequence window
+            residual_seq = None
+            if series_residuals is not None and len(series_residuals) >= i + seq_len:
+                residual_seq = series_residuals[i:i+seq_len]
+            
+            # Prepare model input with residuals
+            weak_seq = weak_ratio[i:i+seq_len] if weak_ratio is not None else None
+            param_seq = param_forecast[:config['data']['forecast_horizon']] if param_forecast is not None else None
+            
+            input_tensor = prepare_model_inputs(
+                input_seq,
+                residuals=residual_seq,
+                weak_signal_ratio=weak_seq,
+                parametric_forecast=param_seq
+            )
             
             train_inputs.append(input_tensor)
             train_targets.append(target_seq)
-            if param_forecast is not None and param_seq is not None:
+            if param_seq is not None:
                 train_param_forecasts.append(param_seq)
         
         # Progress indicator every 10 series
@@ -356,113 +341,6 @@ def prepare_datasets(splits, config):
     return train_loader, val_loader
 
 
-def generate_final_predictions(
-    model: DELPHICore,
-    meta_ensemble: MetaEnsemble,
-    reconciler: MinTReconciliation,  # Always present - core DELPHI feature
-    test_data: Dict[str, np.ndarray],
-    test_weak_ratio: Dict[str, np.ndarray],  # Weak signal ratios for test data
-    tbats: TBATSBaseline,
-    config: Dict,
-    device: str
-) -> Dict[str, Dict[str, np.ndarray]]:
-    """
-    Generate final predictions using complete DELPHI system:
-    1. DELPHI core predictions with uncertainty
-    2. Meta-ensemble predictions from all models
-    3. MinT reconciliation (applied if hierarchy defined, otherwise passes through)
-    4. Combined final forecasts
-    
-    Per HERMES methodology, weak signals (fashion forward data) are used as 
-    external inputs to improve forecast accuracy.
-    
-    Args:
-        model: Trained DELPHI core model
-        meta_ensemble: Meta-ensemble instance
-        reconciler: MinT reconciler instance (always initialized - core feature)
-        test_data: Test data dictionary (main_signal)
-        test_weak_ratio: Weak signal ratios for test data
-        tbats: TBATS baseline for parametric forecasts
-        config: Configuration dictionary
-        device: Device for inference
-    
-    Returns:
-        Dictionary with final predictions and uncertainty
-    """
-    print("\n" + "="*70)
-    print("GENERATING FINAL PREDICTIONS WITH COMPLETE DELPHI SYSTEM")
-    print("="*70)
-    
-    # Get parametric forecasts
-    print("Step 1: Generating parametric baseline forecasts...")
-    param_forecasts, _ = tbats.fit_and_forecast(
-        test_data,
-        forecast_horizon=config['data']['forecast_horizon'],
-        verbose=False
-    )
-    
-    # Get DELPHI core predictions with uncertainty
-    print("Step 2: Generating DELPHI core predictions with uncertainty quantification...")
-    predictor = DELPHIPredictor(model, device=device)
-    
-    delphi_forecasts = {}
-    delphi_uncertainty = {}
-    
-    for series_id, main_signal in list(test_data.items())[:min(100, len(test_data))]:
-        # Get weak signal ratio for this series (per HERMES methodology)
-        weak_ratio = test_weak_ratio.get(series_id) if test_weak_ratio else None
-        param_forecast = param_forecasts.get(series_id)
-        
-        result = predictor.predict_series(
-            main_signal=main_signal[-52:],  # Last 52 weeks
-            weak_signal_ratio=weak_ratio,
-            parametric_forecast=param_forecast,
-            num_samples=config.get('inference', {}).get('num_samples', 100)
-        )
-        
-        delphi_forecasts[series_id] = result['mean']
-        delphi_uncertainty[series_id] = result['std']
-    
-    # Get meta-ensemble predictions
-    print("Step 3: Generating meta-ensemble predictions from all models...")
-    all_model_forecasts = meta_ensemble.predict_all_models(
-        data={sid: test_data[sid] for sid in delphi_forecasts.keys()},
-        delphi_forecast=delphi_forecasts
-    )
-    
-    # Combine forecasts using meta-learner or equal weights
-    print("Step 4: Combining forecasts from all models...")
-    combined_forecasts = meta_ensemble.combine_forecasts(all_model_forecasts)
-    
-    # Apply MinT reconciliation (core feature - always runs, applies if hierarchy defined)
-    print("Step 5: Applying MinT reconciliation...")
-    hierarchy = config.get('reconciliation', {}).get('hierarchy', {})
-    if hierarchy:
-        reconciled_forecasts = reconciler.reconcile(
-            forecasts=combined_forecasts,
-            hierarchy=hierarchy
-        )
-        final_forecasts = reconciled_forecasts
-        print(f"Reconciliation applied: {len(hierarchy)} hierarchy levels")
-    else:
-        # No hierarchy defined - reconciler passes through forecasts unchanged
-        final_forecasts = reconciler.reconcile(forecasts=combined_forecasts, hierarchy=None)
-        print("No hierarchy defined - forecasts passed through unchanged")
-    
-    print("\n" + "="*70)
-    print("PREDICTION COMPLETE")
-    print("="*70)
-    print(f"Generated forecasts for {len(final_forecasts)} series")
-    print(f"Models used: {', '.join(meta_ensemble.models)}")
-    print(f"Uncertainty quantification: Enabled (HMM sampling + Deep Ensemble)")
-    
-    return {
-        'forecasts': final_forecasts,
-        'uncertainty': delphi_uncertainty,
-        'model_forecasts': all_model_forecasts,
-        'delphi_core': delphi_forecasts
-    }
-
 
 def main():
     parser = argparse.ArgumentParser(description='Train DELPHI model')
@@ -519,8 +397,7 @@ def main():
         ensemble_num_layers=config['ensemble']['num_layers'],
         output_dim=config['data']['forecast_horizon'],
         n_ensemble_members=config['ensemble']['n_members'],
-        dropout=config['hmm']['dropout'],
-        use_xlstm_for_trend=config['ensemble']['use_xlstm_for_trend']
+        dropout=config['hmm']['dropout']
     )
     
     # Initialize trainer
@@ -565,125 +442,13 @@ def main():
         'delphi_final.pt'
     )
     trainer.save_checkpoint(checkpoint_path, epoch=config['training']['stage1_epochs'] + config['training']['stage2_epochs'])
-    print(f"DELPHI core training complete! Model saved to {checkpoint_path}")
-    
-    # ====================================================================
-    # META-ENSEMBLE INTEGRATION (Default - Part of Core System)
-    # ====================================================================
-    print("\n" + "="*70)
-    print("INTEGRATING META-ENSEMBLE: PatchTST, N-BEATS, N-HiTS, Chronos-2, xLSTMTime, ETS, SNAIVE")
-    print("="*70)
-    
-    # Initialize meta-ensemble with all models
-    meta_models = config.get('meta_ensemble', {}).get('models', [
-        'delphi_core', 'patchtst', 'nbeats', 'nhits', 'chronos2', 'xlstmtime', 'ets', 'snaive'
-    ])
-    
-    # Get model configs (from models section or meta_ensemble.model_configs)
-    model_configs = config.get('meta_ensemble', {}).get('model_configs', {})
-    if not model_configs:
-        # Fallback to top-level models config
-        model_configs = config.get('models', {})
-    
-    meta_ensemble = MetaEnsemble(
-        models=meta_models,
-        forecast_horizon=config['data']['forecast_horizon'],
-        model_configs=model_configs,
-        meta_learner_config=config.get('meta_ensemble', {}).get('meta_learner', {}),
-        device=device
-    )
-    
-    # Set DELPHI core model
-    meta_ensemble.set_delphi_core(model)
-    
-    # Fit neural models on training data
-    print("\nFitting neural models (PatchTST, N-BEATS, N-HiTS, Chronos-2)...")
-    train_data_dict = {sid: splits['train']['main_signal'][sid] 
-                      for sid in list(splits['train']['main_signal'].keys())[:min(1000, len(splits['train']['main_signal']))]}
-    
-    meta_ensemble.fit_neural_models(
-        data=train_data_dict,
-        context_length=52,
-        config=model_configs
-    )
-    print("Neural models fitted successfully!")
-    
-    # ====================================================================
-    # MINT RECONCILIATION SETUP (Core Feature - Always Initialized)
-    # ====================================================================
-    print("\n" + "="*70)
-    print("SETTING UP MINT RECONCILIATION (Core DELPHI Feature)")
-    print("="*70)
-    
-    reconciliation_enabled = config.get('reconciliation', {}).get('enabled', False)
-    hierarchy = config.get('reconciliation', {}).get('hierarchy', None)
-    
-    # Always create reconciler - it's part of the core system
-    reconciler = MinTReconciliation(
-        method=config.get('reconciliation', {}).get('method', 'mint'),
-        hierarchy_levels=config.get('reconciliation', {}).get('hierarchy_levels', [])
-    )
-    
-    if reconciliation_enabled and hierarchy:
-        print(f"MinT reconciliation active with hierarchy: {len(hierarchy)} parent-child relationships")
-        print("Reconciliation will be applied to ensure hierarchical coherence")
-    else:
-        print("MinT reconciliation initialized (no hierarchy defined - will pass through forecasts unchanged)")
-        print("To use reconciliation, define hierarchy in config: reconciliation.hierarchy")
-    
-    # ====================================================================
-    # SAVE COMPLETE SYSTEM
-    # ====================================================================
-    print("\n" + "="*70)
-    print("SAVING COMPLETE DELPHI SYSTEM")
-    print("="*70)
-    
-    # Save meta-ensemble state
-    meta_ensemble_path = os.path.join(config['training']['save_dir'], 'meta_ensemble.pt')
-    torch.save({
-        'meta_models': meta_models,
-        'model_configs': config.get('meta_ensemble', {}).get('model_configs', {}),
-        'neuralforecast_state': getattr(meta_ensemble, 'neuralforecast_instance', None),
-        'reconciliation_enabled': reconciliation_enabled,
-        'hierarchy': hierarchy
-    }, meta_ensemble_path)
-    print(f"Meta-ensemble configuration saved to {meta_ensemble_path}")
-    
-    # Create predictor for inference
-    predictor = DELPHIPredictor(model, device=device)
-    predictor_path = os.path.join(config['training']['save_dir'], 'predictor.pt')
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'model_config': {
-            'input_dim': 3,
-            'n_states': config['hmm']['n_states'],
-            'hmm_hidden_size': config['hmm']['hidden_size'],
-            'hmm_num_layers': config['hmm']['num_layers'],
-            'ensemble_hidden_size': config['ensemble']['hidden_size'],
-            'ensemble_num_layers': config['ensemble']['num_layers'],
-            'output_dim': config['data']['forecast_horizon'],
-            'n_ensemble_members': config['ensemble']['n_members'],
-            'dropout': config['hmm']['dropout'],
-            'use_xlstm_for_trend': config['ensemble']['use_xlstm_for_trend']
-        }
-    }, predictor_path)
-    print(f"Predictor saved to {predictor_path}")
     
     print("\n" + "="*70)
-    print("TRAINING COMPLETE - FULL DELPHI SYSTEM READY")
+    print("TRAINING COMPLETE")
     print("="*70)
-    print("\nSystem Components:")
-    print(f"  ✓ DELPHI Core (Variational HMM + Deep Ensemble)")
-    print(f"  ✓ Meta-Ensemble Models: {', '.join(meta_models)}")
-    print(f"  ✓ Uncertainty Quantification: HMM Sampling + Deep Ensemble")
-    if reconciliation_enabled:
-        print(f"  ✓ MinT Reconciliation: Enabled")
-    else:
-        print(f"  ✓ MinT Reconciliation: Available (enable in config with hierarchy)")
-    print(f"\nSaved Files:")
-    print(f"  - DELPHI Core: {checkpoint_path}")
-    print(f"  - Meta-Ensemble: {meta_ensemble_path}")
-    print(f"  - Predictor: {predictor_path}")
+    print(f"\nModel saved to: {checkpoint_path}")
+    print("\nTo backtest, run:")
+    print(f"  python evaluate.py --model_path {checkpoint_path}")
     print("\n" + "="*70)
 
 

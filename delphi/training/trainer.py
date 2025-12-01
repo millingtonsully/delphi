@@ -201,9 +201,9 @@ class DELPHITrainer:
             param.requires_grad = False
         
         # Unfreeze HMM prior parameters
-        for param in self.model.hmm_gating.initial_lstm.parameters():
+        for param in self.model.hmm_gating.initial_xlstm.parameters():
             param.requires_grad = True
-        for param in self.model.hmm_gating.transition_lstm.parameters():
+        for param in self.model.hmm_gating.transition_xlstm.parameters():
             param.requires_grad = True
         for param in self.model.hmm_gating.fc_initial.parameters():
             param.requires_grad = True
@@ -234,8 +234,8 @@ class DELPHITrainer:
                     posterior_probs = self.model.hmm_gating(inputs, mode='posterior')
                 
                 # Get prior initial state probabilities (trainable)
-                # This computes p(z_0 | x) using the prior LSTM
-                init_out, _ = self.model.hmm_gating.initial_lstm(inputs[:, :1, :])
+                # This computes p(z_0 | x) using the prior xLSTM
+                init_out, _ = self.model.hmm_gating.initial_xlstm(inputs[:, :1, :])
                 init_logits = self.model.hmm_gating.fc_initial(
                     self.model.hmm_gating.dropout(init_out.squeeze(1))
                 )

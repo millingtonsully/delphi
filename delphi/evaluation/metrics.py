@@ -1,5 +1,5 @@
 """
-Evaluation metrics for DELPHI: MASE, OWA, PDA, calibration metrics.
+Evaluation metrics for DELPHI: MASE, OWA, PDA, Calibration.
 """
 
 import numpy as np
@@ -24,7 +24,7 @@ def mase(
     Returns:
         MASE score
     """
-    mae = np.mean(np.abs(y_true - y_pred))
+    mae_val = np.mean(np.abs(y_true - y_pred))
     
     if y_train is not None:
         # Use seasonal naive error as scale
@@ -42,7 +42,7 @@ def mase(
     if scale < 1e-8:
         return np.inf
     
-    return mae / scale
+    return mae_val / scale
 
 
 def owa(
@@ -61,19 +61,19 @@ def owa(
     Returns:
         OWA score
     """
-    mae = np.mean(np.abs(y_true - y_pred))
+    mae_val = np.mean(np.abs(y_true - y_pred))
     
     if y_naive is not None:
         mae_naive = np.mean(np.abs(y_true - y_naive))
         if mae_naive < 1e-8:
             return np.inf
-        return mae / mae_naive
+        return mae_val / mae_naive
     else:
         # Use mean as naive baseline
         mae_naive = np.mean(np.abs(y_true - np.mean(y_true)))
         if mae_naive < 1e-8:
             return np.inf
-        return mae / mae_naive
+        return mae_val / mae_naive
 
 
 def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -125,53 +125,37 @@ def pda(
 
 def calibration_score(
     y_true: np.ndarray,
-    y_pred: np.ndarray,
-    y_std: np.ndarray,
+    lower_bound: np.ndarray,
+    upper_bound: np.ndarray,
     confidence_level: float = 0.95
-) -> Dict[str, float]:
+) -> Tuple[float, float]:
     """
-    Compute calibration metrics for uncertainty quantification.
+    Compute calibration score for prediction intervals.
     
     Args:
         y_true: True values
-        y_pred: Predicted mean values
-        y_std: Predicted standard deviations
-        confidence_level: Confidence level (e.g., 0.95 for 95% CI)
+        lower_bound: Lower bound of prediction interval
+        upper_bound: Upper bound of prediction interval
+        confidence_level: Expected coverage (default 0.95 for 95% CI)
     
     Returns:
-        Dictionary with calibration metrics
+        Tuple of (coverage, calibration_error):
+            - coverage: Actual proportion of true values within bounds
+            - calibration_error: |coverage - expected_coverage|
     """
-    z_score = {
-        0.90: 1.645,
-        0.95: 1.96,
-        0.99: 2.576
-    }.get(confidence_level, 1.96)
+    in_interval = (y_true >= lower_bound) & (y_true <= upper_bound)
+    coverage = np.mean(in_interval)
+    calibration_error = abs(coverage - confidence_level)
     
-    lower = y_pred - z_score * y_std
-    upper = y_pred + z_score * y_std
-    
-    # Coverage: fraction of true values within confidence interval
-    coverage = np.mean((y_true >= lower) & (y_true <= upper))
-    
-    # Expected coverage
-    expected_coverage = confidence_level
-    
-    # Calibration error
-    calibration_error = abs(coverage - expected_coverage)
-    
-    return {
-        'coverage': coverage,
-        'expected_coverage': expected_coverage,
-        'calibration_error': calibration_error
-    }
+    return coverage, calibration_error
 
 
 def compute_all_metrics(
     y_true: Dict[str, np.ndarray],
     y_pred: Dict[str, np.ndarray],
     y_train: Optional[Dict[str, np.ndarray]] = None,
-    y_std: Optional[Dict[str, np.ndarray]] = None,
-    confidence_level: float = 0.95
+    y_lower: Optional[Dict[str, np.ndarray]] = None,
+    y_upper: Optional[Dict[str, np.ndarray]] = None
 ) -> Dict[str, float]:
     """
     Compute all evaluation metrics.
@@ -180,8 +164,8 @@ def compute_all_metrics(
         y_true: Dictionary of true values
         y_pred: Dictionary of predicted values
         y_train: Dictionary of training data (for MASE)
-        y_std: Dictionary of predicted standard deviations (for calibration)
-        confidence_level: Confidence level for calibration
+        y_lower: Dictionary of lower 95% confidence bounds (for calibration)
+        y_upper: Dictionary of upper 95% confidence bounds (for calibration)
     
     Returns:
         Dictionary of metric scores
@@ -217,12 +201,13 @@ def compute_all_metrics(
         # PDA (Prediction Direction Accuracy)
         all_pda.append(pda(true_vals, pred_vals, train_vals))
         
-        # Calibration
-        if y_std and series_id in y_std:
-            std_vals = y_std[series_id]
-            if len(std_vals) == len(true_vals):
-                calib = calibration_score(true_vals, pred_vals, std_vals, confidence_level)
-                all_coverage.append(calib['coverage'])
+        # Calibration (if uncertainty bounds provided)
+        if y_lower is not None and y_upper is not None:
+            if series_id in y_lower and series_id in y_upper:
+                coverage, _ = calibration_score(
+                    true_vals, y_lower[series_id], y_upper[series_id]
+                )
+                all_coverage.append(coverage)
     
     metrics = {
         'mase': np.mean(all_mase) if all_mase else np.nan,
@@ -232,10 +217,8 @@ def compute_all_metrics(
         'pda': np.mean(all_pda) if all_pda else np.nan
     }
     
+    # Add calibration if uncertainty was provided
     if all_coverage:
-        metrics['coverage'] = np.mean(all_coverage)
-        metrics['expected_coverage'] = confidence_level
-        metrics['calibration_error'] = abs(metrics['coverage'] - confidence_level)
+        metrics['coverage_95'] = np.mean(all_coverage)
     
     return metrics
-

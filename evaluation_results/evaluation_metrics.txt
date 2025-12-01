@@ -8,11 +8,8 @@ Context length: 52
 
 Metrics:
 --------------------------------------------------
-  MASE                : 3.7258
-  OWA                 : 12.5711
-  MAE                 : 0.0135
-  RMSE                : 0.0149
-  PDA                 : 0.5285
-  COVERAGE            : 0.7738
-  EXPECTED_COVERAGE   : 0.9500
-  CALIBRATION_ERROR   : 0.1762
+  MASE                : 8.5886
+  OWA                 : 30.2004
+  MAE                 : 0.0284
+  RMSE                : 0.0299
+  PDA                 : 0.5169
