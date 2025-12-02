@@ -16,9 +16,13 @@ from typing import Any, Union, Optional, Dict
 
 from delphi.models.delphi_core import DELPHICore
 from delphi.models.parametric import TBATSBaseline
-from delphi.data import HERMESDataLoader, preprocess_hermes_data
+from delphi.data import (
+    HERMESDataLoader,
+    preprocess_hermes_data,
+    create_train_val_test_split
+)
 from delphi.data.preprocessing import prepare_model_inputs
-from delphi.evaluation.metrics import compute_all_metrics
+from delphi.evaluation.metrics import compute_all_metrics, mase as mase_score
 
 
 def _ensure_numeric(
@@ -129,8 +133,10 @@ def main():
     
     # Ensure numeric values are properly typed
     forecast_horizon = _ensure_numeric(config['data']['forecast_horizon'], 26, 'int')
+    train_end_week = _ensure_numeric(config['data'].get('train_end_week', 209), 209, 'int')
+    val_end_week = _ensure_numeric(config['data'].get('val_end_week', 261), 261, 'int')
+    seasonal_period = _ensure_numeric(config['data'].get('seasonal_period', 52), 52, 'int')
     context_length = 52  # Fixed context length
-    min_series_length = context_length + forecast_horizon
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -174,17 +180,41 @@ def main():
         verbose=False
     )
     
-    main_signals = preprocessed['main_signal']
-    weak_ratios = preprocessed.get('weak_signal_ratio', {})
+    splits = create_train_val_test_split(
+        preprocessed,
+        train_end_week=train_end_week,
+        val_end_week=val_end_week,
+        forecast_horizon=forecast_horizon
+    )
     
-    # Filter series with sufficient length for holdout evaluation
-    valid_series = [
-        sid for sid, ts in main_signals.items() 
-        if len(ts) >= min_series_length
-    ]
+    train_split = splits['train']
+    val_split = splits['val']
+    test_split = splits['test']
+    
+    train_main = train_split['main_signal']
+    val_main = val_split['main_signal']
+    test_main = test_split['main_signal']
+    weak_train = train_split.get('weak_signal_ratio', {})
+    weak_val = val_split.get('weak_signal_ratio', {})
+    
+    # Determine series with sufficient history and test coverage
+    valid_series = []
+    for series_id in preprocessed['main_signal'].keys():
+        history_main = np.concatenate([
+            train_main.get(series_id, np.array([])),
+            val_main.get(series_id, np.array([]))
+        ])
+        test_seq = test_main.get(series_id, np.array([]))
+        
+        if len(history_main) < context_length:
+            continue
+        if len(test_seq) < forecast_horizon:
+            continue
+        
+        valid_series.append(series_id)
     
     if not valid_series:
-        print(f"\nERROR: No series have sufficient length (need {min_series_length} points).")
+        print("\nERROR: No series have sufficient history for the requested split.")
         print(f"  Context length: {context_length}")
         print(f"  Forecast horizon: {forecast_horizon}")
         return
@@ -204,8 +234,14 @@ def main():
         seasonal_periods=config['parametric'].get('seasonal_periods', [52])
     )
     
-    # Use all data except last forecast_horizon for TBATS fitting
-    tbats_input = {sid: main_signals[sid][:-forecast_horizon] for sid in eval_series}
+    # Use history up to the beginning of the test window for TBATS fitting
+    tbats_input = {}
+    for series_id in eval_series:
+        history_main = np.concatenate([
+            train_main.get(series_id, np.array([])),
+            val_main.get(series_id, np.array([]))
+        ])
+        tbats_input[series_id] = history_main
     param_forecasts, param_residuals = tbats.fit_and_forecast(
         tbats_input,
         forecast_horizon=forecast_horizon,
@@ -216,31 +252,46 @@ def main():
     print("\nRunning DELPHI predictions...")
     predictions = {}
     true_values = {}
-    train_data = {}
+    train_histories = {}
     
     for idx, series_id in enumerate(eval_series, 1):
-        main_signal = main_signals[series_id]
-        weak_ratio = weak_ratios.get(series_id)
+        train_history = train_main.get(series_id, np.array([]))
+        val_history = val_main.get(series_id, np.array([]))
+        history_main = np.concatenate([train_history, val_history])
+        if len(history_main) < context_length:
+            continue
+        test_sequence = test_main.get(series_id, np.array([]))[:forecast_horizon]
+        if len(test_sequence) < forecast_horizon:
+            continue
+        
         param_forecast = param_forecasts.get(series_id)
         series_residuals = param_residuals.get(series_id)
         
-        # Holdout: last forecast_horizon as test, previous context_length as input
-        input_seq = main_signal[-(context_length + forecast_horizon):-forecast_horizon]
-        target_seq = main_signal[-forecast_horizon:]
+        # Use the last context_length points before the test window as model input
+        input_seq = history_main[-context_length:]
+        target_seq = test_sequence
         
-        # Store ground truth and training data
+        # Store ground truth and training data (for MASE scaling)
         true_values[series_id] = target_seq
-        train_data[series_id] = main_signal[:-forecast_horizon]
+        train_histories[series_id] = train_history
         
         # Get residuals for input context
         input_residuals = None
         if series_residuals is not None and len(series_residuals) >= context_length:
             input_residuals = series_residuals[-context_length:]
         
-        # Get weak ratio for input if available
+        # Get weak ratio history up to the test boundary, if available
+        weak_history_segments = []
+        if series_id in weak_train and len(weak_train[series_id]) > 0:
+            weak_history_segments.append(weak_train[series_id])
+        if series_id in weak_val and len(weak_val[series_id]) > 0:
+            weak_history_segments.append(weak_val[series_id])
+        
         input_weak_ratio = None
-        if weak_ratio is not None and len(weak_ratio) >= context_length + forecast_horizon:
-            input_weak_ratio = weak_ratio[-(context_length + forecast_horizon):-forecast_horizon]
+        if weak_history_segments:
+            weak_history = np.concatenate(weak_history_segments)
+            if len(weak_history) >= context_length:
+                input_weak_ratio = weak_history[-context_length:]
         
         # Predict
         result = predict_series(
@@ -264,7 +315,9 @@ def main():
     
     metrics = compute_all_metrics(
         y_true=true_values,
-        y_pred=predictions
+        y_pred=predictions,
+        training_data=train_histories,
+        seasonal_period=seasonal_period
     )
     
     # Print results
@@ -320,11 +373,16 @@ def main():
         
         mse_val = np.mean((pred - true) ** 2)
         mae_val = np.mean(np.abs(pred - true))
+        mase_val = np.nan
+        train_series = train_histories.get(series_id)
+        if train_series is not None and len(train_series) > seasonal_period:
+            mase_val = mase_score(true, pred, train_series, seasonal_period)
         
         summary_rows.append({
             'series_id': series_id,
             'mse': mse_val,
-            'mae': mae_val
+            'mae': mae_val,
+            'mase': mase_val
         })
     
     summary_df = pd.DataFrame(summary_rows)
