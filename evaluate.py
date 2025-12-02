@@ -264,8 +264,7 @@ def main():
     
     metrics = compute_all_metrics(
         y_true=true_values,
-        y_pred=predictions,
-        y_train=train_data
+        y_pred=predictions
     )
     
     # Print results
@@ -319,20 +318,13 @@ def main():
         pred = predictions[series_id]
         true = true_values[series_id]
         
+        mse_val = np.mean((pred - true) ** 2)
         mae_val = np.mean(np.abs(pred - true))
-        rmse_val = np.sqrt(np.mean((pred - true) ** 2))
-        
-        # Direction accuracy
-        last_known = train_data[series_id][-1]
-        true_dir = np.sign(true - last_known)
-        pred_dir = np.sign(pred - last_known)
-        pda_val = np.mean(true_dir == pred_dir)
         
         summary_rows.append({
             'series_id': series_id,
-            'mae': mae_val,
-            'rmse': rmse_val,
-            'pda': pda_val
+            'mse': mse_val,
+            'mae': mae_val
         })
     
     summary_df = pd.DataFrame(summary_rows)

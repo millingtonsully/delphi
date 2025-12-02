@@ -2,14 +2,11 @@ DELPHI Model Evaluation Results
 ==================================================
 
 Model: checkpoints/delphi_final.pt
-Series evaluated: 100
+Series evaluated: 1000
 Forecast horizon: 26
 Context length: 52
 
 Metrics:
 --------------------------------------------------
-  MASE                : 8.5886
-  OWA                 : 30.2004
-  MAE                 : 0.0284
-  RMSE                : 0.0299
-  PDA                 : 0.5169
+  MSE                 : 0.0006
+  MAE                 : 0.0155

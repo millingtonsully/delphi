@@ -171,8 +171,8 @@ class DELPHITrainer:
                     val_loss = val_result['val_loss']
                     self.history['stage1']['val_loss'].append(val_loss)
                     print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {val_loss:.4f}")
-                    print(f"  Validation Metrics - MASE: {val_result['val_mase']:.4f}, "
-                          f"MAE: {val_result['val_mae']:.4f}, RMSE: {val_result['val_rmse']:.4f}")
+                    print(f"  Validation Metrics - MSE: {val_result['val_mse']:.4f}, "
+                          f"MAE: {val_result['val_mae']:.4f}")
                 else:
                     val_loss = val_result
                     self.history['stage1']['val_loss'].append(val_loss)
@@ -283,8 +283,8 @@ class DELPHITrainer:
                     val_loss = val_result['val_loss']
                     self.history['stage2']['val_loss'].append(val_loss)
                     print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {val_loss:.4f}")
-                    print(f"  Validation Metrics - MASE: {val_result['val_mase']:.4f}, "
-                          f"MAE: {val_result['val_mae']:.4f}, RMSE: {val_result['val_rmse']:.4f}")
+                    print(f"  Validation Metrics - MSE: {val_result['val_mse']:.4f}, "
+                          f"MAE: {val_result['val_mae']:.4f}")
                 else:
                     val_loss = val_result
                     self.history['stage2']['val_loss'].append(val_loss)
@@ -345,8 +345,8 @@ class DELPHITrainer:
         avg_loss = np.mean(val_losses)
         
         if compute_metrics:
-            # Compute metrics
-            from ..evaluation.metrics import mase, mae, rmse
+            # Compute metrics (MSE and MAE only)
+            from ..evaluation.metrics import mse, mae
             
             predictions = np.concatenate(all_predictions, axis=0)
             targets = np.concatenate(all_targets, axis=0)
@@ -357,9 +357,8 @@ class DELPHITrainer:
             
             metrics = {
                 'val_loss': avg_loss,
-                'val_mase': mase(target_flat, pred_flat),
-                'val_mae': mae(target_flat, pred_flat),
-                'val_rmse': rmse(target_flat, pred_flat)
+                'val_mse': mse(target_flat, pred_flat),
+                'val_mae': mae(target_flat, pred_flat)
             }
             
             self.model.train()
