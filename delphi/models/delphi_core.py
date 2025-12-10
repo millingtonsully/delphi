@@ -85,14 +85,18 @@ class DELPHICore(nn.Module):
         
         Process:
         1. Compute all emission law predictions (mu, sigma)
-        2. Use mu for prior computation (or future observations for posterior during training)
+        2. Compute state probabilities:
+           - If future_observations provided: use posterior (for Stage 1 training/validation)
+           - If future_observations None: use prior (for inference/prediction)
         3. Sample/use states per timestep
         4. Select emissions based on per-timestep states
         
         Args:
             x: Input tensor of shape (batch, seq_len, input_dim) - past observations
             parametric_forecast: Parametric baseline forecast (batch, output_dim)
-            future_observations: Future observations (batch, output_dim, 1) for posterior during training
+            future_observations: Future observations (batch, output_dim, 1) for posterior computation.
+                When provided (training or validation), uses posterior probabilities for proper ELBO loss.
+                When None, uses prior probabilities for inference/prediction.
             return_states: Whether to return HMM states
         
         Returns:
@@ -121,8 +125,9 @@ class DELPHICore(nn.Module):
         emission_mu_for_prior = emission_mu.permute(1, 2, 0)
         
         # Step 2: Compute state probabilities
-        if self.training and future_observations is not None:
-            # Training: use posterior with future observations
+        if future_observations is not None:
+            # Use posterior with future observations (for training and validation during Stage 1)
+            # During Stage 1, we need posterior probabilities for proper ELBO loss computation
             # future_observations: (batch, output_dim, 1)
             state_probs = self.hmm_gating(
                 x_past=x,
@@ -137,7 +142,7 @@ class DELPHICore(nn.Module):
                 probs_t = state_probs[:, t, :]  # (batch, n_states)
                 states[:, t] = torch.multinomial(probs_t, 1).squeeze(-1)
         else:
-            # Inference: use prior with emission predictions
+            # Inference/prediction: use prior with emission predictions (when future_observations not available)
             # Sample states from prior using Markov chain
             states = self.hmm_gating.sample_states_from_prior(
                 x_past=x,
