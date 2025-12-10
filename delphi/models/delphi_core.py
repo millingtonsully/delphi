@@ -87,7 +87,9 @@ class DELPHICore(nn.Module):
         1. Compute all emission law predictions (mu, sigma)
         2. Compute state probabilities:
            - If future_observations provided: use posterior (for Stage 1 training/validation)
-           - If future_observations None: use prior (for inference/prediction)
+           - If future_observations None: use prior
+             * Training mode: random sampling from prior (for training dynamics)
+             * Eval mode: deterministic argmax from prior (for reproducible validation/inference)
         3. Sample/use states per timestep
         4. Select emissions based on per-timestep states
         
@@ -96,7 +98,9 @@ class DELPHICore(nn.Module):
             parametric_forecast: Parametric baseline forecast (batch, output_dim)
             future_observations: Future observations (batch, output_dim, 1) for posterior computation.
                 When provided (training or validation), uses posterior probabilities for proper ELBO loss.
-                When None, uses prior probabilities for inference/prediction.
+                When None, uses prior probabilities:
+                - Training mode: random sampling (for training dynamics)
+                - Eval mode: deterministic argmax (for reproducible validation/inference)
             return_states: Whether to return HMM states
         
         Returns:
@@ -142,14 +146,8 @@ class DELPHICore(nn.Module):
                 probs_t = state_probs[:, t, :]  # (batch, n_states)
                 states[:, t] = torch.multinomial(probs_t, 1).squeeze(-1)
         else:
-            # Inference/prediction: use prior with emission predictions (when future_observations not available)
-            # Sample states from prior using Markov chain
-            states = self.hmm_gating.sample_states_from_prior(
-                x_past=x,
-                x_future=emission_mu_for_prior
-            )  # (batch, output_dim)
-            
-            # Get state probabilities from prior (for return value)
+            # Use prior with emission predictions (when future_observations not available)
+            # Get state probabilities from prior
             init_probs, trans_matrices = self.hmm_gating.get_prior_components(
                 x_past=x,
                 x_future=emission_mu_for_prior
@@ -161,6 +159,17 @@ class DELPHICore(nn.Module):
                 prev_probs = state_probs[:, t-1, :].unsqueeze(1)  # (batch, 1, n_states)
                 trans_matrix = trans_matrices[:, t-1, :, :]  # (batch, n_states, n_states)
                 state_probs[:, t, :] = torch.bmm(prev_probs, trans_matrix).squeeze(1)
+            
+            # Select states: random sampling during training, deterministic argmax during validation/inference
+            if self.training:
+                # Training: use random sampling from prior (for training dynamics)
+                states = self.hmm_gating.sample_states_from_prior(
+                    x_past=x,
+                    x_future=emission_mu_for_prior
+                )  # (batch, output_dim)
+            else:
+                # Validation/Inference: use deterministic argmax for reproducible metrics
+                states = torch.argmax(state_probs, dim=-1)  # (batch, output_dim)
         
         # Step 3: Get correction from ensemble with per-timestep state routing
         correction_mu, correction_sigma = self.ensemble(x, states=states)  # (batch, output_dim) each
