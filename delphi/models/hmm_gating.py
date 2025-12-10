@@ -16,6 +16,10 @@ class VariationalHMMGating(nn.Module):
     """
     Variational HMM Gating Module for regime detection and routing.
     
+    Implements per-timestep state probabilities:
+    - Posterior: q(z_t | x_past, y_future) outputs (horizon, K) probabilities
+    - Prior: p(z_t | x_past, mu_future) outputs initial state + (horizon-1, K, K) transition matrices
+    
     Models temporal regime persistence via Markov chains with variational
     posterior for tractable inference. Supports two-stage ELBO training.
     Uses xLSTM with exponential gating for enhanced long-term memory.
@@ -27,7 +31,8 @@ class VariationalHMMGating(nn.Module):
         n_states: int = 4,
         hidden_size: int = 64,
         num_layers: int = 2,
-        dropout: float = 0.2
+        dropout: float = 0.2,
+        horizon: int = 26  # Forecast horizon for per-timestep probabilities
     ):
         """
         Initialize Variational HMM Gating module.
@@ -38,139 +43,218 @@ class VariationalHMMGating(nn.Module):
             hidden_size: Hidden size for xLSTM layers
             num_layers: Number of xLSTM layers
             dropout: Dropout rate
+            horizon: Forecast horizon (for per-timestep state probabilities)
         """
         super().__init__()
         
         self.input_dim = input_dim
         self.n_states = n_states
         self.hidden_size = hidden_size
+        self.horizon = horizon
         
-        # Initial state xLSTM (for prior)
-        self.initial_xlstm = xLSTM(
+        # Prior model: takes past input + future emission predictions (mu)
+        # Past input xLSTM
+        self.prior_past_xlstm = xLSTM(
             input_dim, hidden_size, num_layers, 
             batch_first=True, dropout=dropout if num_layers > 1 else 0
         )
-        self.fc_initial = nn.Linear(hidden_size, n_states)
         
-        # Transition xLSTM (for prior)
-        self.transition_xlstm = xLSTM(
-            input_dim + n_states, hidden_size, num_layers,
+        # Future emission predictions xLSTM (takes mu: horizon × K)
+        self.prior_future_xlstm = xLSTM(
+            n_states, hidden_size, num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0
         )
-        self.fc_trans = nn.Linear(hidden_size, n_states * n_states)
         
-        # Posterior xLSTM
-        self.posterior_xlstm = xLSTM(
+        # Prior outputs: initial state + transition matrices
+        # Concatenate past and future features
+        self.prior_fc_initial = nn.Linear(hidden_size * 2, n_states)
+        self.prior_fc_transitions = nn.Linear(
+            hidden_size * 2, 
+            (horizon - 1) * n_states * n_states
+        )
+        
+        # Posterior model: takes past input + future observations
+        # Past input xLSTM
+        self.posterior_past_xlstm = xLSTM(
             input_dim, hidden_size, num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0
         )
-        self.fc_posterior = nn.Linear(hidden_size, n_states)
+        
+        # Future observations xLSTM (takes y: horizon × 1)
+        self.posterior_future_xlstm = xLSTM(
+            1, hidden_size, num_layers,
+            batch_first=True, dropout=dropout if num_layers > 1 else 0
+        )
+        
+        # Posterior outputs: per-timestep state probabilities (horizon × K)
+        # Concatenate past and future features
+        self.posterior_fc = nn.Linear(hidden_size * 2, horizon * n_states)
         
         self.dropout = nn.Dropout(dropout)
     
     def forward(
         self, 
-        x: torch.Tensor, 
+        x_past: torch.Tensor,
+        x_future: Optional[torch.Tensor] = None,
         mode: str = 'posterior'
     ) -> torch.Tensor:
         """
         Forward pass through HMM gating module.
         
         Args:
-            x: Input tensor of shape (batch, seq_len, input_dim)
-            mode: 'posterior' for variational posterior, 'prior' for prior sampling
+            x_past: Past input tensor of shape (batch, past_seq_len, input_dim)
+            x_future: Future input tensor
+                - For posterior: future observations (batch, horizon, 1)
+                - For prior: future emission predictions (batch, horizon, n_states)
+            mode: 'posterior' for variational posterior, 'prior' for prior
         
         Returns:
-            State probabilities or sampled states
+            - Posterior mode: State probabilities (batch, horizon, n_states)
+            - Prior mode: Tuple of (initial_probs, transition_matrices)
+                - initial_probs: (batch, n_states)
+                - transition_matrices: (batch, horizon-1, n_states, n_states)
         """
-        batch_size, seq_len, _ = x.shape
+        batch_size = x_past.shape[0]
         
         if mode == 'posterior':
-            # Variational posterior: q(z|x)
-            out, _ = self.posterior_xlstm(x)
-            out = self.dropout(out)
-            # Average over sequence for global posterior
-            logits = self.fc_posterior(out.mean(dim=1))
-            probs = F.softmax(logits, dim=-1)
+            # Variational posterior: q(z_t | x_past, y_future)
+            # Output: (batch, horizon, n_states) - per-timestep state probabilities
+            if x_future is None:
+                raise ValueError("Posterior mode requires x_future (future observations)")
+            
+            # Process past input
+            past_out, _ = self.posterior_past_xlstm(x_past)
+            past_feat = past_out.mean(dim=1)  # (batch, hidden_size)
+            past_feat = self.dropout(past_feat)
+            
+            # Process future observations
+            future_out, _ = self.posterior_future_xlstm(x_future)
+            future_feat = future_out.mean(dim=1)  # (batch, hidden_size)
+            future_feat = self.dropout(future_feat)
+            
+            # Concatenate past and future features
+            combined_feat = torch.cat([past_feat, future_feat], dim=-1)  # (batch, 2*hidden_size)
+            
+            # Output per-timestep state probabilities
+            logits = self.posterior_fc(combined_feat)  # (batch, horizon * n_states)
+            logits = logits.view(batch_size, self.horizon, self.n_states)
+            probs = F.softmax(logits, dim=-1)  # (batch, horizon, n_states)
+            
             return probs
         
         elif mode == 'prior':
-            # Prior sampling: p(z|x) via Markov chain
-            trajectories = []
+            # Prior: p(z_t | x_past, mu_future)
+            # Output: (initial_probs, transition_matrices)
+            if x_future is None:
+                raise ValueError("Prior mode requires x_future (future emission predictions mu)")
             
-            # Initial state
-            init_out, _ = self.initial_xlstm(x[:, :1, :])
-            init_logits = self.fc_initial(self.dropout(init_out.squeeze(1)))
-            init_probs = F.softmax(init_logits, dim=-1)
+            # Process past input
+            past_out, _ = self.prior_past_xlstm(x_past)
+            past_feat = past_out.mean(dim=1)  # (batch, hidden_size)
+            past_feat = self.dropout(past_feat)
             
-            # Sample initial state
-            states = torch.multinomial(init_probs, 1)  # (batch, 1)
-            trajectories.append(states)
+            # Process future emission predictions (mu: horizon × n_states)
+            future_out, _ = self.prior_future_xlstm(x_future)
+            future_feat = future_out.mean(dim=1)  # (batch, hidden_size)
+            future_feat = self.dropout(future_feat)
             
-            # Transition states
-            for t in range(1, seq_len):
-                # One-hot encode previous state
-                prev_onehot = F.one_hot(states.squeeze(1), self.n_states).float()
-                
-                # Concatenate input and previous state
-                trans_input = torch.cat([
-                    x[:, t:t+1, :], 
-                    prev_onehot.unsqueeze(1)
-                ], dim=-1)
-                
-                # Get transition probabilities
-                trans_out, _ = self.transition_xlstm(trans_input)
-                trans_logits = self.fc_trans(self.dropout(trans_out.squeeze(1)))
-                trans_matrix = F.softmax(
-                    trans_logits.view(-1, self.n_states, self.n_states), 
-                    dim=-1
-                )
-                
-                # Compute next state probabilities
-                # p(z_t | z_{t-1}, x_t) = sum_{z_{t-1}} p(z_t | z_{t-1}) * p(z_{t-1} | x_{:t})
-                prev_probs = init_probs.unsqueeze(1)  # (batch, 1, n_states)
-                next_probs = torch.bmm(prev_probs, trans_matrix).squeeze(1)
-                
-                # Sample next state
-                states = torch.multinomial(next_probs, 1)
-                trajectories.append(states)
+            # Concatenate past and future features
+            combined_feat = torch.cat([past_feat, future_feat], dim=-1)  # (batch, 2*hidden_size)
             
-            # Stack trajectories
-            trajectory = torch.cat(trajectories, dim=1)  # (batch, seq_len)
-            return trajectory
+            # Initial state probabilities
+            init_logits = self.prior_fc_initial(combined_feat)  # (batch, n_states)
+            init_probs = F.softmax(init_logits, dim=-1)  # (batch, n_states)
+            
+            # Per-timestep transition matrices
+            trans_logits = self.prior_fc_transitions(combined_feat)  # (batch, (horizon-1)*K*K)
+            trans_logits = trans_logits.view(
+                batch_size, self.horizon - 1, self.n_states, self.n_states
+            )
+            trans_matrices = F.softmax(trans_logits, dim=-1)  # (batch, horizon-1, K, K)
+            
+            return init_probs, trans_matrices
         
         else:
             raise ValueError(f"Unknown mode: {mode}. Use 'posterior' or 'prior'")
     
-    def get_state_probs(self, x: torch.Tensor) -> torch.Tensor:
-        """Get posterior state probabilities."""
-        return self.forward(x, mode='posterior')
-    
-    def get_transition_matrix(self, x: torch.Tensor) -> torch.Tensor:
+    def sample_states_from_prior(
+        self,
+        x_past: torch.Tensor,
+        x_future: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Get learned transition matrix from input.
+        Sample state trajectory from prior using Markov chain.
         
         Args:
-            x: Input tensor
+            x_past: Past input (batch, past_seq_len, input_dim)
+            x_future: Future emission predictions (batch, horizon, n_states)
         
         Returns:
-            Transition matrix of shape (batch, n_states, n_states)
+            Sampled states (batch, horizon) - one state per timestep
         """
-        batch_size = x.shape[0]
-        seq_len = x.shape[1]
+        init_probs, trans_matrices = self.forward(x_past, x_future, mode='prior')
         
-        # Use first timestep for initial state
-        init_out, _ = self.initial_xlstm(x[:, :1, :])
-        init_probs = F.softmax(self.fc_initial(self.dropout(init_out.squeeze(1))), dim=-1)
+        batch_size = x_past.shape[0]
+        states = []
         
-        # Get transition matrix from middle timestep
-        mid_idx = seq_len // 2
-        prev_onehot = F.one_hot(torch.argmax(init_probs, dim=-1), self.n_states).float()
-        trans_input = torch.cat([x[:, mid_idx:mid_idx+1, :], prev_onehot.unsqueeze(1)], dim=-1)
-        trans_out, _ = self.transition_xlstm(trans_input)
-        trans_logits = self.fc_trans(self.dropout(trans_out.squeeze(1)))
-        trans_matrix = F.softmax(trans_logits.view(-1, self.n_states, self.n_states), dim=-1)
+        # Sample initial state
+        z_0 = torch.multinomial(init_probs, 1).squeeze(-1)  # (batch,)
+        states.append(z_0)
         
-        return trans_matrix
+        # Sample subsequent states using transition matrices
+        z_prev = z_0
+        for t in range(self.horizon - 1):
+            # Get transition probabilities for current timestep
+            trans_matrix = trans_matrices[:, t, :, :]  # (batch, K, K)
+            
+            # Get probabilities for next state given previous state
+            z_prev_onehot = F.one_hot(z_prev, self.n_states).float()  # (batch, K)
+            next_probs = torch.bmm(
+                z_prev_onehot.unsqueeze(1),  # (batch, 1, K)
+                trans_matrix  # (batch, K, K)
+            ).squeeze(1)  # (batch, K)
+            
+            # Sample next state
+            z_next = torch.multinomial(next_probs, 1).squeeze(-1)  # (batch,)
+            states.append(z_next)
+            z_prev = z_next
+        
+        # Stack to get (batch, horizon)
+        trajectory = torch.stack(states, dim=1)
+        return trajectory
+    
+    def get_state_probs(
+        self, 
+        x_past: torch.Tensor, 
+        x_future: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Get posterior state probabilities.
+        
+        Args:
+            x_past: Past input (batch, past_seq_len, input_dim)
+            x_future: Future observations (batch, horizon, 1)
+        
+        Returns:
+            State probabilities (batch, horizon, n_states)
+        """
+        return self.forward(x_past, x_future, mode='posterior')
+    
+    def get_prior_components(
+        self,
+        x_past: torch.Tensor,
+        x_future: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get prior initial state and transition matrices.
+        
+        Args:
+            x_past: Past input (batch, past_seq_len, input_dim)
+            x_future: Future emission predictions (batch, horizon, n_states)
+        
+        Returns:
+            Tuple of (initial_probs, transition_matrices)
+        """
+        return self.forward(x_past, x_future, mode='prior')
 
 

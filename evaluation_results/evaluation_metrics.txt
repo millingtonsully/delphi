@@ -2,12 +2,101 @@ DELPHI Model Evaluation Results
 ==================================================
 
 Model: checkpoints/delphi_final.pt
-Series evaluated: 5
+Series evaluated: 100
 Forecast horizon: 26
 Context length: 52
+Seasonal period: 52
 
 Metrics:
 --------------------------------------------------
-  MSE                 : 0.0001
-  MAE                 : 0.0082
-  MASE                : 2.0539
+  MSE                 : 0.0002
+  MAE                 : 0.0087
+  MASE                : 1.7959
+
+
+MASE Diagnostic Components (sample series):
+--------------------------------------------------
+
+Series: br_female_outerwear_0
+  MASE: 0.6863
+  Scaling Factor (T-m)/h: 6.0385
+  Error Ratio: 0.1137
+  Mean Forecast Error: 0.0021
+  Mean Seasonal Naive Error: 0.0030
+  Sum Forecast Errors: 0.0542
+  Sum Seasonal Naive Errors: 0.4770
+
+Series: br_female_outerwear_1
+  MASE: 0.4994
+  Scaling Factor (T-m)/h: 6.0385
+  Error Ratio: 0.0827
+  Mean Forecast Error: 0.0022
+  Mean Seasonal Naive Error: 0.0045
+  Sum Forecast Errors: 0.0583
+  Sum Seasonal Naive Errors: 0.7048
+
+Series: br_female_outerwear_2
+  MASE: 1.9283
+  Scaling Factor (T-m)/h: 6.0385
+  Error Ratio: 0.3193
+  Mean Forecast Error: 0.0079
+  Mean Seasonal Naive Error: 0.0041
+  Sum Forecast Errors: 0.2052
+  Sum Seasonal Naive Errors: 0.6425
+
+Series: br_female_outerwear_3
+  MASE: 0.5003
+  Scaling Factor (T-m)/h: 6.0385
+  Error Ratio: 0.0829
+  Mean Forecast Error: 0.0015
+  Mean Seasonal Naive Error: 0.0031
+  Sum Forecast Errors: 0.0397
+  Sum Seasonal Naive Errors: 0.4792
+
+Series: br_female_outerwear_4
+  MASE: 3.0654
+  Scaling Factor (T-m)/h: 6.0385
+  Error Ratio: 0.5076
+  Mean Forecast Error: 0.0178
+  Mean Seasonal Naive Error: 0.0058
+  Sum Forecast Errors: 0.4628
+  Sum Seasonal Naive Errors: 0.9116
+
+
+Re-seasonalization Diagnostics (sample series):
+--------------------------------------------------
+
+Series: br_female_outerwear_0
+  Needed Forecasting: False
+  Seasonal Component Mean: -0.0002 ± 0.0031
+  Deseasonalized Forecast Mean: 0.0109
+  Re-seasonalized Forecast Mean: 0.0107
+  True Values Mean: 0.0093
+
+Series: br_female_outerwear_1
+  Needed Forecasting: False
+  Seasonal Component Mean: -0.0001 ± 0.0037
+  Deseasonalized Forecast Mean: 0.0151
+  Re-seasonalized Forecast Mean: 0.0150
+  True Values Mean: 0.0131
+
+Series: br_female_outerwear_2
+  Needed Forecasting: False
+  Seasonal Component Mean: -0.0004 ± 0.0027
+  Deseasonalized Forecast Mean: 0.0099
+  Re-seasonalized Forecast Mean: 0.0095
+  True Values Mean: 0.0113
+
+Series: br_female_outerwear_3
+  Needed Forecasting: False
+  Seasonal Component Mean: 0.0004 ± 0.0030
+  Deseasonalized Forecast Mean: 0.0091
+  Re-seasonalized Forecast Mean: 0.0094
+  True Values Mean: 0.0083
+
+Series: br_female_outerwear_4
+  Needed Forecasting: False
+  Seasonal Component Mean: 0.0008 ± 0.0082
+  Deseasonalized Forecast Mean: 0.0470
+  Re-seasonalized Forecast Mean: 0.0479
+  True Values Mean: 0.0301

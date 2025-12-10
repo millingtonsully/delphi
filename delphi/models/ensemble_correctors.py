@@ -6,7 +6,7 @@ M=4 ensemble members with specialized roles matching 4 HMM states.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Tuple
 
 from .xlstm_layer import xLSTM
 
@@ -45,10 +45,11 @@ class EnsembleMember(nn.Module):
             input_dim, hidden_size, num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0
         )
-        self.fc = nn.Linear(hidden_size, output_dim)
+        self.fc_mu = nn.Linear(hidden_size, output_dim)
+        self.fc_sigma = nn.Linear(hidden_size, output_dim)
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through ensemble member.
         
@@ -56,14 +57,19 @@ class EnsembleMember(nn.Module):
             x: Input tensor of shape (batch, seq_len, input_dim)
         
         Returns:
-            Correction forecast of shape (batch, output_dim)
+            Tuple of (mu, sigma):
+                - mu: Mean forecast of shape (batch, output_dim)
+                - sigma: Standard deviation of shape (batch, output_dim)
         """
         out, _ = self.xlstm(x)
         # Use last timestep
         last_hidden = out[:, -1, :]
         last_hidden = self.dropout(last_hidden)
-        correction = self.fc(last_hidden)
-        return correction
+        mu = self.fc_mu(last_hidden)
+        sigma_logits = self.fc_sigma(last_hidden)
+        # Apply softplus to ensure sigma > 0, add small epsilon for numerical stability
+        sigma = F.softplus(sigma_logits) + 1e-6
+        return mu, sigma
 
 
 class TrendCorrectorRNN(EnsembleMember):
@@ -82,7 +88,7 @@ class TrendCorrectorRNN(EnsembleMember):
     ):
         super().__init__(input_dim, hidden_size, num_layers, output_dim, dropout)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with trend-focused processing."""
         return super().forward(x)
 
@@ -102,7 +108,7 @@ class SeasonalityCorrectorRNN(EnsembleMember):
     ):
         super().__init__(input_dim, hidden_size, num_layers, output_dim, dropout)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with seasonality-focused processing."""
         return super().forward(x)
 
@@ -124,17 +130,22 @@ class VolatilityShiftCorrectorRNN(EnsembleMember):
         # Additional layer for volatility modeling
         self.volatility_fc = nn.Linear(hidden_size, output_dim)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with volatility modeling."""
         out, _ = self.xlstm(x)
         last_hidden = out[:, -1, :]
         last_hidden = self.dropout(last_hidden)
         
-        # Combine trend and volatility corrections
-        trend_correction = self.fc(last_hidden)
+        # Combine trend and volatility corrections for mu
+        trend_correction = self.fc_mu(last_hidden)
         volatility_correction = self.volatility_fc(last_hidden)
+        mu = trend_correction + 0.5 * volatility_correction
         
-        return trend_correction + 0.5 * volatility_correction
+        # Sigma from base class
+        sigma_logits = self.fc_sigma(last_hidden)
+        sigma = F.softplus(sigma_logits) + 1e-6
+        
+        return mu, sigma
 
 
 class ExternalSignalSpecialist(EnsembleMember):
@@ -155,7 +166,7 @@ class ExternalSignalSpecialist(EnsembleMember):
         # Layer for weak signal integration (always used)
         self.signal_fc = nn.Linear(hidden_size + 1, output_dim)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass with weak signal integration.
         
@@ -163,7 +174,9 @@ class ExternalSignalSpecialist(EnsembleMember):
             x: Input tensor where x[:, :, 1] is weak signal ratio
         
         Returns:
-            Correction forecast
+            Tuple of (mu, sigma):
+                - mu: Mean forecast with weak signal integration
+                - sigma: Standard deviation
         """
         out, _ = self.xlstm(x)
         last_hidden = out[:, -1, :]
@@ -172,9 +185,13 @@ class ExternalSignalSpecialist(EnsembleMember):
         # Extract weak signal (second feature) and always integrate
         weak_signal = x[:, -1, 1]  # Last timestep, weak signal feature
         signal_input = torch.cat([last_hidden, weak_signal.unsqueeze(1)], dim=-1)
-        correction = self.signal_fc(signal_input)
+        mu = self.signal_fc(signal_input)
         
-        return correction
+        # Sigma from base class (doesn't use weak signal)
+        sigma_logits = self.fc_sigma(last_hidden)
+        sigma = F.softplus(sigma_logits) + 1e-6
+        
+        return mu, sigma
 
 
 class DeepEnsembleCorrectors(nn.Module):
@@ -222,38 +239,72 @@ class DeepEnsembleCorrectors(nn.Module):
         self,
         x: torch.Tensor,
         states: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through ensemble with state-based routing.
         
         Args:
             x: Input tensor of shape (batch, seq_len, input_dim)
-            states: HMM states for routing (batch, seq_len)
+            states: HMM states for routing
+                - If (batch, horizon): per-timestep states for forecast horizon
+                - If (batch, seq_len): legacy format, uses last state
+                - If None: ensemble average
         
         Returns:
-            Ensemble correction of shape (batch, output_dim)
+            Tuple of (correction_mu, correction_sigma):
+                - correction_mu: Mean correction of shape (batch, output_dim)
+                - correction_sigma: Standard deviation of shape (batch, output_dim)
         """
-        # Run all correctors
-        corrections = []
+        # Run all correctors to get emission predictions (mu, sigma)
+        emission_mus = []
+        emission_sigmas = []
         for corrector in self.correctors:
-            correction = corrector(x)
-            corrections.append(correction)
+            mu, sigma = corrector(x)
+            emission_mus.append(mu)
+            emission_sigmas.append(sigma)
         
-        # Stack corrections: (n_members, batch, output_dim)
-        corrections = torch.stack(corrections, dim=0)
+        # Stack: (n_members, batch, output_dim)
+        emission_mu = torch.stack(emission_mus, dim=0)  # (n_members, batch, output_dim)
+        emission_sigma = torch.stack(emission_sigmas, dim=0)  # (n_members, batch, output_dim)
         
         # Route based on HMM states
         if states is not None:
-            # Use last timestep state to select corrector
-            # State 0 -> Trend, State 1 -> Seasonality, State 2 -> Volatility, State 3 -> External
-            final_states = states[:, -1]  # (batch,)
-            state_weights = F.one_hot(final_states, num_classes=self.n_members).float()
-            state_weights = state_weights.unsqueeze(-1)  # (batch, n_members, 1)
-            
-            # Weighted combination based on state
-            weighted_corrections = (corrections.permute(1, 0, 2) * state_weights).sum(dim=1)
-            return weighted_corrections
+            # Check if states are per-timestep (horizon) or legacy (seq_len)
+            if states.shape[1] == self.output_dim:
+                # Per-timestep states: (batch, horizon)
+                # For each timestep t, use emission law z_t
+                batch_size = states.shape[0]
+                horizon = states.shape[1]
+                
+                # For each timestep, select the corrector based on state
+                batch_indices = torch.arange(batch_size, device=states.device).unsqueeze(1).expand(-1, horizon)
+                timestep_indices = torch.arange(horizon, device=states.device).unsqueeze(0).expand(batch_size, -1)
+                
+                # Select mu and sigma for each (batch, timestep) pair based on state
+                selected_mu = emission_mu[
+                    states,  # (batch, horizon) - which corrector to use
+                    batch_indices,  # (batch, horizon) - batch index
+                    timestep_indices  # (batch, horizon) - timestep index
+                ]  # (batch, horizon)
+                
+                selected_sigma = emission_sigma[
+                    states,
+                    batch_indices,
+                    timestep_indices
+                ]  # (batch, horizon)
+                
+                return selected_mu, selected_sigma
+            else:
+                # Legacy format: use last timestep state for all timesteps
+                final_states = states[:, -1]  # (batch,)
+                state_weights = F.one_hot(final_states, num_classes=self.n_members).float()
+                state_weights = state_weights.unsqueeze(-1)  # (batch, n_members, 1)
+                
+                # Weighted combination based on state
+                weighted_mu = (emission_mu.permute(1, 0, 2) * state_weights).sum(dim=1)
+                weighted_sigma = (emission_sigma.permute(1, 0, 2) * state_weights).sum(dim=1)
+                return weighted_mu, weighted_sigma
         else:
             # Ensemble average if no states provided
-            return corrections.mean(dim=0)
+            return emission_mu.mean(dim=0), emission_sigma.mean(dim=0)
 

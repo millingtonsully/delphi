@@ -6,9 +6,86 @@ import numpy as np
 from typing import Dict, Optional, Tuple, List
 import warnings
 import time
+import os
+import multiprocessing
 from tbats import TBATS
 
 warnings.filterwarnings('ignore')
+
+
+def _fit_single_series(args):
+    """
+    Helper function to fit TBATS model for a single series.
+    This function is designed to be picklable for multiprocessing.
+    
+    Args:
+        args: Tuple of (series_id, ts, use_box_cox, use_trend, use_arma_errors, 
+                        seasonal_periods, n_jobs, min_seasonal_length)
+    
+    Returns:
+        Tuple of (series_id, result_dict) where result_dict contains:
+            - 'model': fitted TBATS model or None if failed
+            - 'scale_factor': scaling factor applied
+            - 'success': bool indicating success
+            - 'error': error message if failed
+    """
+    series_id, ts, use_box_cox, use_trend, use_arma_errors, seasonal_periods, n_jobs, min_seasonal_length = args
+    
+    # Check if series is too short
+    if len(ts) < min_seasonal_length:
+        return (series_id, {
+            'model': None,
+            'scale_factor': 1.0,
+            'success': False,
+            'error': f'Series too short (length {len(ts)} < {min_seasonal_length})'
+        })
+    
+    try:
+        # Handle Box-Cox transformation for small values
+        scale_factor = 1.0
+        ts_positive = ts.copy()
+        
+        if use_box_cox:
+            min_val = np.min(ts)
+            if min_val < 0.01:
+                if min_val <= 0:
+                    offset = abs(min_val) + 0.001
+                    ts_positive = ts + offset
+                    min_val = np.min(ts_positive)
+                
+                if min_val < 0.01:
+                    scale_factor = 0.01 / min_val
+                    ts_positive = ts_positive * scale_factor
+            else:
+                ts_positive = np.maximum(ts, 1e-6)
+        else:
+            ts_positive = np.maximum(ts, 1e-6)
+        
+        # Fit TBATS model
+        estimator = TBATS(
+            use_box_cox=use_box_cox,
+            use_trend=use_trend,
+            use_arma_errors=use_arma_errors,
+            seasonal_periods=seasonal_periods,
+            n_jobs=n_jobs
+        )
+        
+        fitted_model = estimator.fit(ts_positive)
+        
+        return (series_id, {
+            'model': fitted_model,
+            'scale_factor': scale_factor,
+            'success': True,
+            'error': None
+        })
+        
+    except Exception as e:
+        return (series_id, {
+            'model': None,
+            'scale_factor': 1.0,
+            'success': False,
+            'error': str(e)
+        })
 
 
 class TBATSBaseline:
@@ -23,7 +100,8 @@ class TBATSBaseline:
         use_trend: bool = True,
         use_arma_errors: bool = True,
         seasonal_periods: Optional[List[int]] = None,
-        n_jobs: int = 1
+        n_jobs: int = 1,
+        n_parallel_workers: int = 8
     ):
         """
         Initialize TBATS baseline model.
@@ -33,17 +111,30 @@ class TBATSBaseline:
             use_trend: Whether to include trend component
             use_arma_errors: Whether to use ARMA errors
             seasonal_periods: List of seasonal periods (e.g., [52] for annual)
-            n_jobs: Number of parallel jobs for fitting
+            n_jobs: Number of parallel jobs for TBATS internal fitting (per series)
+            n_parallel_workers: Number of parallel workers for fitting multiple series (default: 8)
         """
         self.use_box_cox = use_box_cox
         self.use_trend = use_trend
         self.use_arma_errors = use_arma_errors
         self.seasonal_periods = seasonal_periods or [52]
         self.n_jobs = n_jobs
+        # Limit to available CPU cores
+        available_cores = os.cpu_count() or 1
+        self.n_parallel_workers = min(n_parallel_workers, available_cores)
         
         self.fitted_models: Dict[str, any] = {}
         self.forecasts: Dict[str, np.ndarray] = {}
         self.residuals: Dict[str, np.ndarray] = {}
+        # Track scaling factors for each series (to reverse Box-Cox scaling)
+        self.scaling_factors: Dict[str, float] = {}
+        # Diagnostics: track fitting success
+        self.fitting_stats = {
+            'successful_fits': 0,
+            'failed_fits': 0,
+            'fallback_to_mean': 0,
+            'scaling_applied': 0
+        }
     
     def fit(
         self,
@@ -52,7 +143,7 @@ class TBATSBaseline:
         verbose: bool = True
     ) -> Dict[str, any]:
         """
-        Fit TBATS model to each time series.
+        Fit TBATS model to each time series using multiprocessing.
         
         Args:
             time_series: Dictionary of series_id -> time series array
@@ -63,50 +154,110 @@ class TBATSBaseline:
             Dictionary of fitted models
         """
         self.fitted_models = {}
-        total_series = len(time_series)
-        start_time = time.time()
+        self.scaling_factors = {}
+        self.fitting_stats = {
+            'successful_fits': 0,
+            'failed_fits': 0,
+            'fallback_to_mean': 0,
+            'scaling_applied': 0
+        }
         
-        for idx, (series_id, ts) in enumerate(time_series.items(), 1):
-            if len(ts) < max(self.seasonal_periods) * 2:
-                # Skip series that are too short
-                if verbose:
-                    print(f"Warning: Series {series_id} too short for TBATS, skipping")
-                continue
+        total_series = len(time_series)
+        if total_series == 0:
+            return self.fitted_models
+        
+        start_time = time.time()
+        min_seasonal_length = max(self.seasonal_periods) * 2
+        
+        # Prepare arguments for multiprocessing
+        fit_args = [
+            (series_id, ts, self.use_box_cox, self.use_trend, self.use_arma_errors,
+             self.seasonal_periods, self.n_jobs, min_seasonal_length)
+            for series_id, ts in time_series.items()
+        ]
+        
+        # Use multiprocessing if we have multiple workers and series
+        if self.n_parallel_workers > 1 and total_series > 1:
+            if verbose:
+                print(f"Fitting TBATS models for {total_series} series using {self.n_parallel_workers} parallel workers...")
             
-            try:
-                # Ensure non-negative values for Box-Cox
-                ts_positive = np.maximum(ts, 0.1)
+            # Process with multiprocessing using imap_unordered for better progress tracking
+            with multiprocessing.Pool(processes=self.n_parallel_workers) as pool:
+                completed = 0
+                results_dict = {}
                 
-                # Fit TBATS model
-                estimator = TBATS(
-                    use_box_cox=self.use_box_cox,
-                    use_trend=self.use_trend,
-                    use_arma_errors=self.use_arma_errors,
-                    seasonal_periods=self.seasonal_periods,
-                    n_jobs=self.n_jobs
-                )
+                # Use imap_unordered to get results as they complete
+                for result in pool.imap_unordered(_fit_single_series, fit_args):
+                    series_id, result_dict = result
+                    results_dict[series_id] = result_dict
+                    completed += 1
+                    
+                    # Progress indicator every 100 series or at completion
+                    if verbose and (completed % 100 == 0 or completed == total_series):
+                        elapsed = time.time() - start_time
+                        rate = completed / elapsed if elapsed > 0 else 0
+                        remaining = (total_series - completed) / rate if rate > 0 else 0
+                        pct = (completed / total_series) * 100
+                        print(f"Fitting TBATS models... {completed}/{total_series} ({pct:.1f}%) "
+                              f"| Elapsed: {elapsed:.1f}s | Rate: {rate:.2f} series/s | "
+                              f"Est. remaining: {remaining:.1f}s")
                 
-                fitted_model = estimator.fit(ts_positive)
-                self.fitted_models[series_id] = fitted_model
-                
-            except Exception as e:
-                if verbose:
-                    print(f"Error fitting TBATS for {series_id}: {e}")
-                # Fallback: use simple mean
-                self.fitted_models[series_id] = None
+                # Process all results
+                for series_id, result_dict in results_dict.items():
+                    if result_dict['success']:
+                        self.fitted_models[series_id] = result_dict['model']
+                        self.scaling_factors[series_id] = result_dict['scale_factor']
+                        self.fitting_stats['successful_fits'] += 1
+                        if result_dict['scale_factor'] != 1.0:
+                            self.fitting_stats['scaling_applied'] += 1
+                    else:
+                        if verbose and result_dict['error'] and 'too short' not in result_dict['error'].lower():
+                            print(f"Warning: Series {series_id} failed: {result_dict['error']}")
+                        self.fitted_models[series_id] = None
+                        self.scaling_factors[series_id] = 1.0
+                        self.fitting_stats['failed_fits'] += 1
+        else:
+            # Sequential processing (fallback or single worker)
+            if verbose:
+                print(f"Fitting TBATS models for {total_series} series sequentially...")
             
-            # Progress indicator every 1000 series
-            if verbose and idx % 1000 == 0:
-                elapsed = time.time() - start_time
-                rate = idx / elapsed if elapsed > 0 else 0
-                remaining = (total_series - idx) / rate if rate > 0 else 0
-                print(f"Fitting TBATS models... {idx}/{total_series} series processed "
-                      f"(elapsed: {elapsed:.1f}s, est. remaining: {remaining:.1f}s)")
+            for idx, (series_id, ts) in enumerate(time_series.items(), 1):
+                args = (series_id, ts, self.use_box_cox, self.use_trend, self.use_arma_errors,
+                        self.seasonal_periods, self.n_jobs, min_seasonal_length)
+                series_id_result, result_dict = _fit_single_series(args)
+                
+                if result_dict['success']:
+                    self.fitted_models[series_id_result] = result_dict['model']
+                    self.scaling_factors[series_id_result] = result_dict['scale_factor']
+                    self.fitting_stats['successful_fits'] += 1
+                    if result_dict['scale_factor'] != 1.0:
+                        self.fitting_stats['scaling_applied'] += 1
+                else:
+                    if verbose and result_dict['error']:
+                        print(f"Warning: Series {series_id_result} failed: {result_dict['error']}")
+                    self.fitted_models[series_id_result] = None
+                    self.scaling_factors[series_id_result] = 1.0
+                    self.fitting_stats['failed_fits'] += 1
+                
+                # Progress indicator every 100 series
+                if verbose and idx % 100 == 0:
+                    elapsed = time.time() - start_time
+                    rate = idx / elapsed if elapsed > 0 else 0
+                    remaining = (total_series - idx) / rate if rate > 0 else 0
+                    pct = (idx / total_series) * 100
+                    print(f"Fitting TBATS models... {idx}/{total_series} ({pct:.1f}%) "
+                          f"| Elapsed: {elapsed:.1f}s | Rate: {rate:.2f} series/s | "
+                          f"Est. remaining: {remaining:.1f}s")
         
         if verbose and total_series > 0:
             elapsed = time.time() - start_time
-            print(f"TBATS fitting complete. Fitted {len(self.fitted_models)}/{total_series} models "
-                  f"in {elapsed:.1f}s")
+            successful = self.fitting_stats['successful_fits']
+            print(f"\nTBATS fitting complete. Fitted {successful}/{total_series} models "
+                  f"in {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
+            if self.fitting_stats['scaling_applied'] > 0:
+                print(f"  Applied scaling to {self.fitting_stats['scaling_applied']} series for Box-Cox")
+            if self.fitting_stats['failed_fits'] > 0:
+                print(f"  Failed fits: {self.fitting_stats['failed_fits']}")
         
         return self.fitted_models
     
@@ -147,12 +298,23 @@ class TBATSBaseline:
                 forecasts[series_id] = np.full(forecast_horizon, mean_val)
                 if return_residuals:
                     residuals[series_id] = ts - mean_val
+                # Ensure scaling factor exists for consistency
+                if series_id not in self.scaling_factors:
+                    self.scaling_factors[series_id] = 1.0
+                self.fitting_stats['fallback_to_mean'] += 1
                 continue
             
             try:
                 # Generate forecast
                 forecast_result = fitted_model.forecast(steps=forecast_horizon)
-                forecasts[series_id] = np.array(forecast_result)
+                forecast_array = np.array(forecast_result)
+                
+                # Scale forecast back to original scale if scaling was applied
+                scale_factor = self.scaling_factors.get(series_id, 1.0)
+                if scale_factor != 1.0:
+                    forecast_array = forecast_array / scale_factor
+                
+                forecasts[series_id] = forecast_array
                 
                 # Compute in-sample fitted values and residuals
                 if return_residuals:
@@ -166,6 +328,9 @@ class TBATSBaseline:
                         fitted_values = fitted_model.fitted
                     
                     if fitted_values is not None and len(fitted_values) == len(ts):
+                        # Scale fitted values back to original scale
+                        if scale_factor != 1.0:
+                            fitted_values = fitted_values / scale_factor
                         residuals[series_id] = ts - fitted_values
                     else:
                         # Fallback: compute residuals using mean as approximation
@@ -233,6 +398,10 @@ class TBATSBaseline:
         if series_id in self.residuals:
             return self.residuals[series_id]
         return None
+    
+    def get_fitting_stats(self) -> Dict[str, int]:
+        """Get statistics about TBATS fitting."""
+        return self.fitting_stats.copy()
 
 
 def fit_parametric_baseline(

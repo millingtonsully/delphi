@@ -31,28 +31,32 @@ hmm:
   n_states: 4  # Number of latent states (matches 4 correctors)
   hidden_size: 64
   num_layers: 2
-  dropout: 0.2
+  dropout: 0.4  # Increased from 0.3 for better regularization
 
 # Deep Ensemble Correctors
 ensemble:
   n_members: 4  # 4 specialized correctors (1:1 with HMM states)
   hidden_size: 64
   num_layers: 2
-  dropout: 0.2
+  dropout: 0.4  # Increased from 0.3 for better regularization
 
 # Training Configuration
 training:
   batch_size: 32
-  learning_rate: 1e-3
-  weight_decay: 1e-5
-  early_stopping_patience: 10
+  learning_rate: 1e-4
+  weight_decay: 5e-3  # Increased from 1e-3 for better regularization
+  early_stopping_patience: 5  # Reduced from 10 to stop sooner when overfitting
   early_stopping_min_delta: 1e-4
   
   # Two-stage ELBO training
-  stage1_epochs: 15  # Emissions/posterior training
-  stage2_epochs: 10  # Prior training
-  kl_weight: 0.1     # KL divergence weight in ELBO
+  stage1_epochs: 25  # Emissions/posterior training
+  stage2_epochs: 15  # Prior training
+  kl_weight: 0.1     # Base KL divergence weight in ELBO
   entropy_weight: 0.01  # Entropy regularization weight
+  kl_anneal: true
+  kl_start: 0.01
+  kl_end: 0.1
+  kl_warmup_epochs: 10
   
   # Checkpointing
   save_dir: "checkpoints"

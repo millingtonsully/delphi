@@ -59,7 +59,8 @@ class DELPHICore(nn.Module):
             n_states=n_states,
             hidden_size=hmm_hidden_size,
             num_layers=hmm_num_layers,
-            dropout=dropout
+            dropout=dropout,
+            horizon=output_dim  # Forecast horizon for per-timestep probabilities
         )
         
         # Deep Ensemble Correctors (xLSTM-based)
@@ -76,50 +77,111 @@ class DELPHICore(nn.Module):
         self,
         x: torch.Tensor,
         parametric_forecast: Optional[torch.Tensor] = None,
+        future_observations: Optional[torch.Tensor] = None,
         return_states: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through DELPHI model.
         
+        Process:
+        1. Compute all emission law predictions (mu, sigma)
+        2. Use mu for prior computation (or future observations for posterior during training)
+        3. Sample/use states per timestep
+        4. Select emissions based on per-timestep states
+        
         Args:
-            x: Input tensor of shape (batch, seq_len, input_dim)
+            x: Input tensor of shape (batch, seq_len, input_dim) - past observations
             parametric_forecast: Parametric baseline forecast (batch, output_dim)
+            future_observations: Future observations (batch, output_dim, 1) for posterior during training
             return_states: Whether to return HMM states
         
         Returns:
             Dictionary with:
                 - 'correction': Correction from ensemble (batch, output_dim)
                 - 'forecast': Final forecast (batch, output_dim)
-                - 'states': HMM states if return_states=True
-                - 'state_probs': HMM state probabilities
+                - 'states': HMM states if return_states=True (batch, output_dim)
+                - 'state_probs': HMM state probabilities (batch, output_dim, n_states)
         """
         batch_size = x.shape[0]
         
-        # Get HMM state probabilities (posterior for training)
-        state_probs = self.hmm_gating(x, mode='posterior')
+        # Step 1: Compute all emission law predictions (mu, sigma from all correctors)
+        # Get mu and sigma from all ensemble members
+        all_mus = []
+        all_sigmas = []
+        for corrector in self.ensemble.correctors:
+            mu, sigma = corrector(x)  # (batch, output_dim) each
+            all_mus.append(mu)
+            all_sigmas.append(sigma)
         
-        if self.training:
-            # Training: sample single state from posterior
-            states = torch.multinomial(state_probs, 1).squeeze(-1)  # (batch,)
-            states_expanded = states.unsqueeze(1).expand(-1, x.shape[1])  # (batch, seq_len)
+        # Stack: (n_states, batch, output_dim)
+        emission_mu = torch.stack(all_mus, dim=0)
+        emission_sigma = torch.stack(all_sigmas, dim=0)
+        
+        # Reshape for prior: (batch, output_dim, n_states)
+        emission_mu_for_prior = emission_mu.permute(1, 2, 0)
+        
+        # Step 2: Compute state probabilities
+        if self.training and future_observations is not None:
+            # Training: use posterior with future observations
+            # future_observations: (batch, output_dim, 1)
+            state_probs = self.hmm_gating(
+                x_past=x,
+                x_future=future_observations,
+                mode='posterior'
+            )  # (batch, output_dim, n_states)
+            
+            # Sample states from posterior per timestep
+            # For each timestep, sample from categorical distribution
+            states = torch.zeros(batch_size, self.output_dim, dtype=torch.long, device=x.device)
+            for t in range(self.output_dim):
+                probs_t = state_probs[:, t, :]  # (batch, n_states)
+                states[:, t] = torch.multinomial(probs_t, 1).squeeze(-1)
         else:
-            # Inference: use per-timestep trajectory sampling via Markov chain
-            states_expanded = self.hmm_gating(x, mode='prior')  # (batch, seq_len)
-            states = states_expanded[:, -1]  # Last timestep state for return
+            # Inference: use prior with emission predictions
+            # Sample states from prior using Markov chain
+            states = self.hmm_gating.sample_states_from_prior(
+                x_past=x,
+                x_future=emission_mu_for_prior
+            )  # (batch, output_dim)
+            
+            # Get state probabilities from prior (for return value)
+            init_probs, trans_matrices = self.hmm_gating.get_prior_components(
+                x_past=x,
+                x_future=emission_mu_for_prior
+            )
+            # Compute per-timestep probabilities from prior
+            state_probs = torch.zeros(batch_size, self.output_dim, self.n_states, device=x.device)
+            state_probs[:, 0, :] = init_probs
+            for t in range(1, self.output_dim):
+                prev_probs = state_probs[:, t-1, :].unsqueeze(1)  # (batch, 1, n_states)
+                trans_matrix = trans_matrices[:, t-1, :, :]  # (batch, n_states, n_states)
+                state_probs[:, t, :] = torch.bmm(prev_probs, trans_matrix).squeeze(1)
         
-        # Get correction from ensemble with state-based routing
-        correction = self.ensemble(x, states=states_expanded)
+        # Step 3: Get correction from ensemble with per-timestep state routing
+        correction_mu, correction_sigma = self.ensemble(x, states=states)  # (batch, output_dim) each
         
-        # Combine with parametric forecast
+        # Combine with parametric forecast (add to mu, keep sigma from emissions)
         if parametric_forecast is not None:
-            forecast = parametric_forecast + correction
+            mu_final = parametric_forecast + correction_mu
+            sigma_final = correction_sigma
+            forecast = mu_final  # Forecast is the mean
         else:
             # If no parametric forecast, use correction only
-            forecast = correction
+            mu_final = correction_mu
+            sigma_final = correction_sigma
+            forecast = mu_final
+
+        # Clamp final mean to prevent extreme outputs (stabilizes ELBO)
+        mu_final = torch.clamp(mu_final, -5.0, 5.0)
+        forecast = mu_final
         
         result = {
-            'correction': correction,
+            'correction': correction_mu,  # Keep for backward compatibility
             'forecast': forecast,
+            'mu': mu_final,
+            'sigma': sigma_final,
+            'emission_mu': emission_mu,  # All emission mus for loss computation
+            'emission_sigma': emission_sigma,  # All emission sigmas for loss computation
             'state_probs': state_probs
         }
         
@@ -154,15 +216,27 @@ class DELPHICore(nn.Module):
         preds = []
         
         with torch.no_grad():
+            # Compute emission predictions for prior
+            all_mus = []
+            for corrector in self.ensemble.correctors:
+                mu, _ = corrector(x)
+                all_mus.append(mu)
+            emission_mu = torch.stack(all_mus, dim=0)  # (n_states, batch, output_dim)
+            emission_mu_for_prior = emission_mu.permute(1, 2, 0)  # (batch, output_dim, n_states)
+            
             for _ in range(num_samples):
-                # Sample per-timestep trajectory via Markov chain
-                states = self.hmm_gating(x, mode='prior')  # (batch, seq_len)
-                correction = self.ensemble(x, states=states)
+                # Sample per-timestep trajectory via Markov chain from prior
+                states = self.hmm_gating.sample_states_from_prior(
+                    x_past=x,
+                    x_future=emission_mu_for_prior
+                )  # (batch, output_dim)
+                
+                correction_mu, _ = self.ensemble(x, states=states)
                 
                 if parametric_forecast is not None:
-                    pred = parametric_forecast + correction
+                    pred = parametric_forecast + correction_mu
                 else:
-                    pred = correction
+                    pred = correction_mu
                 preds.append(pred)
         
         # Stack samples: (num_samples, batch, output_dim)
@@ -182,24 +256,47 @@ class DELPHICore(nn.Module):
     
     def get_regime_explanation(
         self,
-        x: torch.Tensor
+        x: torch.Tensor,
+        future_observations: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Get interpretable regime explanation from HMM states.
         
         Args:
-            x: Input tensor
+            x: Input tensor (past observations)
+            future_observations: Future observations (batch, output_dim, 1) for posterior
         
         Returns:
             Dictionary with regime information
         """
-        state_probs = self.hmm_gating.get_state_probs(x)
-        transition_matrix = self.hmm_gating.get_transition_matrix(x)
+        # Compute emission predictions for prior
+        all_mus = []
+        for corrector in self.ensemble.correctors:
+            mu, _ = corrector(x)
+            all_mus.append(mu)
+        emission_mu = torch.stack(all_mus, dim=0)  # (n_states, batch, output_dim)
+        emission_mu_for_prior = emission_mu.permute(1, 2, 0)  # (batch, output_dim, n_states)
+        
+        if future_observations is not None:
+            state_probs = self.hmm_gating.get_state_probs(x, future_observations)
+        else:
+            # Use prior probabilities
+            init_probs, trans_matrices = self.hmm_gating.get_prior_components(
+                x_past=x,
+                x_future=emission_mu_for_prior
+            )
+            batch_size = x.shape[0]
+            state_probs = torch.zeros(batch_size, self.output_dim, self.n_states, device=x.device)
+            state_probs[:, 0, :] = init_probs
+            for t in range(1, self.output_dim):
+                prev_probs = state_probs[:, t-1, :].unsqueeze(1)
+                trans_matrix = trans_matrices[:, t-1, :, :]
+                state_probs[:, t, :] = torch.bmm(prev_probs, trans_matrix).squeeze(1)
         
         return {
-            'state_probs': state_probs,
-            'transition_matrix': transition_matrix,
-            'dominant_state': torch.argmax(state_probs, dim=-1)
+            'state_probs': state_probs,  # (batch, horizon, n_states)
+            'transition_matrices': trans_matrices if future_observations is None else None,
+            'dominant_states': torch.argmax(state_probs, dim=-1)  # (batch, horizon)
         }
 
 

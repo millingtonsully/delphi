@@ -67,7 +67,14 @@ class DELPHITrainer:
         kl_weight: float = 0.1,
         entropy_weight: float = 0.01,
         stage1_epochs: int = 50,
-        stage2_epochs: int = 30
+        stage2_epochs: int = 30,
+        kl_anneal: bool = False,
+        kl_start: Optional[float] = None,
+        kl_end: Optional[float] = None,
+        kl_warmup_epochs: int = 0,
+        early_stopping_patience: int = 10,
+        early_stopping_min_delta: float = 1e-4,
+        checkpoint_dir: Optional[str] = None
     ):
         """
         Initialize DELPHI trainer.
@@ -81,11 +88,34 @@ class DELPHITrainer:
             entropy_weight: Entropy regularization weight
             stage1_epochs: Number of epochs for stage 1 (emissions/posterior)
             stage2_epochs: Number of epochs for stage 2 (prior)
+            early_stopping_patience: Number of epochs to wait before stopping if no improvement
+            early_stopping_min_delta: Minimum change to qualify as an improvement
+            checkpoint_dir: Directory to save checkpoints (for best model)
         """
         self.model = model.to(device)
         self.device = device
         self.stage1_epochs = stage1_epochs
         self.stage2_epochs = stage2_epochs
+        self.base_kl_weight = kl_weight
+
+        # KL annealing configuration
+        self.kl_anneal = kl_anneal
+        self.kl_start = kl_start if kl_start is not None else kl_weight
+        self.kl_end = kl_end if kl_end is not None else kl_weight
+        self.kl_warmup_epochs = max(0, kl_warmup_epochs)
+        
+        # Early stopping configuration
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_min_delta = early_stopping_min_delta
+        self.checkpoint_dir = checkpoint_dir
+        
+        # Track best validation loss and patience counter (per stage)
+        self.best_val_loss_stage1 = float('inf')
+        self.best_val_loss_stage2 = float('inf')
+        self.patience_counter_stage1 = 0
+        self.patience_counter_stage2 = 0
+        self.best_epoch_stage1 = 0
+        self.best_epoch_stage2 = 0
         
         # Optimizers
         self.optimizer = optim.Adam(
@@ -106,6 +136,48 @@ class DELPHITrainer:
             'stage1': {'train_loss': [], 'val_loss': []},
             'stage2': {'train_loss': [], 'val_loss': []}
         }
+        
+        # Print GPU status on initialization
+        self._print_gpu_status()
+    
+    def _print_gpu_status(self):
+        """Print current GPU memory status and device information."""
+        if self.device.startswith('cuda') and torch.cuda.is_available():
+            print("\n" + "="*70)
+            print("GPU Status")
+            print("="*70)
+            gpu_id = int(self.device.split(':')[1]) if ':' in self.device else 0
+            print(f"Using GPU: {torch.cuda.get_device_name(gpu_id)}")
+            print(f"Device: {self.device}")
+            
+            # Check model is on GPU
+            model_device = next(self.model.parameters()).device
+            print(f"Model device: {model_device}")
+            
+            # Memory info
+            memory_allocated = torch.cuda.memory_allocated(gpu_id) / (1024**3)
+            memory_reserved = torch.cuda.memory_reserved(gpu_id) / (1024**3)
+            memory_total = torch.cuda.get_device_properties(gpu_id).total_memory / (1024**3)
+            print(f"GPU Memory:")
+            print(f"  Total: {memory_total:.2f} GB")
+            print(f"  Reserved: {memory_reserved:.2f} GB")
+            print(f"  Allocated: {memory_allocated:.2f} GB")
+            print(f"  Free: {memory_total - memory_reserved:.2f} GB")
+            print("="*70 + "\n")
+        else:
+            print(f"\n⚠️  Using CPU (device: {self.device})")
+            if torch.cuda.is_available():
+                print("   Note: CUDA is available but not being used.")
+                print("   Set device='cuda' to use GPU.\n")
+    
+    def _get_gpu_memory_info(self) -> str:
+        """Get current GPU memory usage as a formatted string."""
+        if self.device.startswith('cuda') and torch.cuda.is_available():
+            gpu_id = int(self.device.split(':')[1]) if ':' in self.device else 0
+            allocated = torch.cuda.memory_allocated(gpu_id) / (1024**3)
+            reserved = torch.cuda.memory_reserved(gpu_id) / (1024**3)
+            return f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        return ""
     
     def train_stage1(
         self,
@@ -126,6 +198,22 @@ class DELPHITrainer:
         
         for epoch in range(num_epochs):
             train_losses = []
+
+            # KL annealing: update KL weight for this epoch
+            if self.kl_anneal and self.kl_warmup_epochs > 0:
+                # epoch is zero-based; use epoch+1 for human-friendly schedule
+                factor = min(1.0, float(epoch + 1) / float(self.kl_warmup_epochs))
+                current_kl = self.kl_start + factor * (self.kl_end - self.kl_start)
+            else:
+                current_kl = self.kl_end
+            # Apply to underlying ELBO loss
+            self.loss_fn.elbo_loss.kl_weight = current_kl
+            
+            # Print GPU memory at start of first epoch
+            if epoch == 0:
+                mem_info = self._get_gpu_memory_info()
+                if mem_info:
+                    print(f"\n{mem_info}\n")
             
             for batch in tqdm(train_loader, desc=f"Stage 1 Epoch {epoch+1}/{num_epochs}"):
                 inputs = batch['input'].to(self.device)
@@ -134,15 +222,32 @@ class DELPHITrainer:
                 if parametric_forecasts is not None:
                     parametric_forecasts = parametric_forecasts.to(self.device)
                 
-                # Forward pass
-                outputs = self.model(inputs, parametric_forecast=parametric_forecasts)
+                # Verify tensors are on correct device (only check first batch)
+                if epoch == 0 and len(train_losses) == 0:
+                    if self.device.startswith('cuda'):
+                        assert inputs.device.type == 'cuda', f"Inputs on {inputs.device}, expected {self.device}"
+                        assert targets.device.type == 'cuda', f"Targets on {targets.device}, expected {self.device}"
                 
-                # Get posterior probabilities
+                # Forward pass with future observations for posterior
+                # Reshape targets to (batch, horizon, 1) for posterior
+                future_obs = targets.unsqueeze(-1)  # (batch, horizon, 1)
+                outputs = self.model(
+                    inputs, 
+                    parametric_forecast=parametric_forecasts,
+                    future_observations=future_obs
+                )
+                
+                # Get posterior probabilities (batch, horizon, n_states)
                 posterior_probs = outputs['state_probs']
                 
-                # Compute loss
+                # Get emission mu and sigma for loss computation
+                emission_mu = outputs['emission_mu']  # (n_states, batch, horizon)
+                emission_sigma = outputs['emission_sigma']  # (n_states, batch, horizon)
+                
+                # Compute loss with log-likelihood
                 loss_dict = self.loss_fn(
-                    outputs['forecast'],
+                    emission_mu,
+                    emission_sigma,
                     targets,
                     posterior_probs=posterior_probs,
                     stage='stage1'
@@ -161,6 +266,12 @@ class DELPHITrainer:
             avg_train_loss = np.mean(train_losses)
             self.history['stage1']['train_loss'].append(avg_train_loss)
             
+            # Print GPU memory usage periodically (every 10 epochs)
+            if (epoch + 1) % 10 == 0 or epoch == num_epochs - 1:
+                mem_info = self._get_gpu_memory_info()
+                if mem_info:
+                    print(f"\n  {mem_info}")
+            
             # Validation
             if val_loader is not None:
                 # Compute metrics every 10 epochs or on last epoch
@@ -177,6 +288,27 @@ class DELPHITrainer:
                     val_loss = val_result
                     self.history['stage1']['val_loss'].append(val_loss)
                     print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {val_loss:.4f}")
+                
+                # Early stopping check
+                if val_loss < (self.best_val_loss_stage1 - self.early_stopping_min_delta):
+                    # Improvement detected
+                    self.best_val_loss_stage1 = val_loss
+                    self.best_epoch_stage1 = epoch + 1
+                    self.patience_counter_stage1 = 0
+                    
+                    # Save best model checkpoint
+                    if self.checkpoint_dir is not None:
+                        best_checkpoint_path = os.path.join(self.checkpoint_dir, 'best_model_stage1.pt')
+                        self.save_checkpoint(best_checkpoint_path, epoch + 1, is_best=True)
+                        print(f"  ✓ Best model saved (Val Loss: {val_loss:.4f})")
+                else:
+                    # No improvement
+                    self.patience_counter_stage1 += 1
+                    if self.patience_counter_stage1 >= self.early_stopping_patience:
+                        print(f"\nEarly stopping triggered at epoch {epoch+1}")
+                        print(f"Best validation loss: {self.best_val_loss_stage1:.4f} at epoch {self.best_epoch_stage1}")
+                        print(f"No improvement for {self.early_stopping_patience} epochs.")
+                        return
             else:
                 print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}")
     
@@ -196,18 +328,22 @@ class DELPHITrainer:
         """
         num_epochs = num_epochs or self.stage2_epochs
         
+        # For Stage 2, use the final KL weight (no annealing needed here)
+        self.loss_fn.elbo_loss.kl_weight = self.kl_end
+        
         # Freeze all parameters except HMM prior
         for param in self.model.parameters():
             param.requires_grad = False
         
         # Unfreeze HMM prior parameters
-        for param in self.model.hmm_gating.initial_xlstm.parameters():
+        # Prior uses prior_past_xlstm, prior_future_xlstm, prior_fc_initial, prior_fc_transitions
+        for param in self.model.hmm_gating.prior_past_xlstm.parameters():
             param.requires_grad = True
-        for param in self.model.hmm_gating.transition_xlstm.parameters():
+        for param in self.model.hmm_gating.prior_future_xlstm.parameters():
             param.requires_grad = True
-        for param in self.model.hmm_gating.fc_initial.parameters():
+        for param in self.model.hmm_gating.prior_fc_initial.parameters():
             param.requires_grad = True
-        for param in self.model.hmm_gating.fc_trans.parameters():
+        for param in self.model.hmm_gating.prior_fc_transitions.parameters():
             param.requires_grad = True
         
         # Create optimizer for prior only
@@ -221,6 +357,12 @@ class DELPHITrainer:
         for epoch in range(num_epochs):
             train_losses = []
             
+            # Print GPU memory at start of first epoch
+            if epoch == 0:
+                mem_info = self._get_gpu_memory_info()
+                if mem_info:
+                    print(f"\n{mem_info}\n")
+            
             for batch in tqdm(train_loader, desc=f"Stage 2 Epoch {epoch+1}/{num_epochs}"):
                 inputs = batch['input'].to(self.device)
                 targets = batch['target'].to(self.device)
@@ -228,39 +370,69 @@ class DELPHITrainer:
                 if parametric_forecasts is not None:
                     parametric_forecasts = parametric_forecasts.to(self.device)
                 
+                # Verify tensors are on correct device (only check first batch)
+                if epoch == 0 and len(train_losses) == 0:
+                    if self.device.startswith('cuda'):
+                        assert inputs.device.type == 'cuda', f"Inputs on {inputs.device}, expected {self.device}"
+                        assert targets.device.type == 'cuda', f"Targets on {targets.device}, expected {self.device}"
+                
                 # Forward pass
                 with torch.no_grad():
-                    # Get posterior probabilities (frozen)
-                    posterior_probs = self.model.hmm_gating(inputs, mode='posterior')
+                    # Get posterior probabilities (frozen) using future observations
+                    future_obs = targets.unsqueeze(-1)  # (batch, horizon, 1)
+                    posterior_probs = self.model.hmm_gating(
+                        x_past=inputs,
+                        x_future=future_obs,
+                        mode='posterior'
+                    )  # (batch, horizon, n_states)
                 
-                # Get prior initial state probabilities (trainable)
-                # This computes p(z_0 | x) using the prior xLSTM
-                init_out, _ = self.model.hmm_gating.initial_xlstm(inputs[:, :1, :])
-                init_logits = self.model.hmm_gating.fc_initial(
-                    self.model.hmm_gating.dropout(init_out.squeeze(1))
+                # Get prior probabilities (trainable)
+                # First compute emission predictions for prior
+                all_mus = []
+                all_sigmas = []
+                for corrector in self.model.ensemble.correctors:
+                    mu, sigma = corrector(inputs)
+                    all_mus.append(mu)
+                    all_sigmas.append(sigma)
+                emission_mu = torch.stack(all_mus, dim=0)  # (n_states, batch, horizon)
+                emission_sigma = torch.stack(all_sigmas, dim=0)  # (n_states, batch, horizon)
+                emission_mu_for_prior = emission_mu.permute(1, 2, 0)  # (batch, horizon, n_states)
+                
+                # Get prior components
+                init_probs, trans_matrices = self.model.hmm_gating.get_prior_components(
+                    x_past=inputs,
+                    x_future=emission_mu_for_prior
                 )
-                prior_probs = torch.nn.functional.softmax(init_logits, dim=-1)
                 
-                # Compute log probabilities for KL divergence
-                # KL(q||p) = sum_z q(z) * (log q(z) - log p(z))
-                posterior_logp = torch.log(posterior_probs + 1e-8)
-                prior_logp = torch.log(prior_probs + 1e-8)
+                # Compute per-timestep prior probabilities
+                # Build as list to avoid in-place operations that break autograd
+                batch_size = inputs.shape[0]
+                prior_probs_list = [init_probs]
+                for t in range(1, self.model.output_dim):
+                    prev_probs = prior_probs_list[-1].unsqueeze(1)  # (batch, 1, n_states)
+                    trans_matrix = trans_matrices[:, t-1, :, :]  # (batch, n_states, n_states)
+                    next_probs = torch.bmm(prev_probs, trans_matrix).squeeze(1)  # (batch, n_states)
+                    prior_probs_list.append(next_probs)
+                prior_probs = torch.stack(prior_probs_list, dim=1)  # (batch, horizon, n_states)
                 
-                # KL divergence: E_q[log q - log p]
-                kl_div = (posterior_probs * (posterior_logp - prior_logp)).sum(dim=-1).mean()
+                # Compute log probabilities for KL divergence (per-timestep)
+                posterior_logp = torch.log(posterior_probs + 1e-8)  # (batch, horizon, n_states)
+                prior_logp = torch.log(prior_probs + 1e-8)  # (batch, horizon, n_states)
                 
                 # Compute loss (just the KL term for Stage 2)
+                # Pass full tensors (not .mean()) - loss function will handle averaging
                 loss_dict = self.loss_fn(
-                    torch.zeros_like(targets),  # Dummy reconstruction
-                    torch.zeros_like(targets),  # Dummy target
-                    prior_logp=prior_logp.mean(),
-                    posterior_logp=posterior_logp.mean(),
+                    emission_mu,
+                    emission_sigma,
+                    targets,
+                    prior_logp=prior_logp,
+                    posterior_logp=posterior_logp,
                     posterior_probs=posterior_probs,
                     stage='stage2'
                 )
                 
-                # Use the computed KL divergence as the loss
-                loss = kl_div
+                # Use the loss from loss function (should be KL term)
+                loss = loss_dict['total_loss']
                 
                 # Backward pass
                 prior_optimizer.zero_grad()
@@ -272,6 +444,12 @@ class DELPHITrainer:
             
             avg_train_loss = np.mean(train_losses)
             self.history['stage2']['train_loss'].append(avg_train_loss)
+            
+            # Print GPU memory usage periodically (every 10 epochs)
+            if (epoch + 1) % 10 == 0 or epoch == num_epochs - 1:
+                mem_info = self._get_gpu_memory_info()
+                if mem_info:
+                    print(f"\n  {mem_info}")
             
             # Validation
             if val_loader is not None:
@@ -289,6 +467,27 @@ class DELPHITrainer:
                     val_loss = val_result
                     self.history['stage2']['val_loss'].append(val_loss)
                     print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {val_loss:.4f}")
+                
+                # Early stopping check
+                if val_loss < (self.best_val_loss_stage2 - self.early_stopping_min_delta):
+                    # Improvement detected
+                    self.best_val_loss_stage2 = val_loss
+                    self.best_epoch_stage2 = epoch + 1
+                    self.patience_counter_stage2 = 0
+                    
+                    # Save best model checkpoint
+                    if self.checkpoint_dir is not None:
+                        best_checkpoint_path = os.path.join(self.checkpoint_dir, 'best_model_stage2.pt')
+                        self.save_checkpoint(best_checkpoint_path, epoch + 1, is_best=True)
+                        print(f"  ✓ Best model saved (Val Loss: {val_loss:.4f})")
+                else:
+                    # No improvement
+                    self.patience_counter_stage2 += 1
+                    if self.patience_counter_stage2 >= self.early_stopping_patience:
+                        print(f"\nEarly stopping triggered at epoch {epoch+1}")
+                        print(f"Best validation loss: {self.best_val_loss_stage2:.4f} at epoch {self.best_epoch_stage2}")
+                        print(f"No improvement for {self.early_stopping_patience} epochs.")
+                        return
             else:
                 print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}")
         
@@ -326,15 +525,75 @@ class DELPHITrainer:
                 if parametric_forecasts is not None:
                     parametric_forecasts = parametric_forecasts.to(self.device)
                 
-                outputs = self.model(inputs, parametric_forecast=parametric_forecasts)
-                posterior_probs = outputs['state_probs']
+                # Get emission mu and sigma first (needed for both prior and posterior)
+                all_mus = []
+                all_sigmas = []
+                for corrector in self.model.ensemble.correctors:
+                    mu, sigma = corrector(inputs)
+                    all_mus.append(mu)
+                    all_sigmas.append(sigma)
+                emission_mu = torch.stack(all_mus, dim=0)  # (n_states, batch, horizon)
+                emission_sigma = torch.stack(all_sigmas, dim=0)  # (n_states, batch, horizon)
                 
-                loss_dict = self.loss_fn(
-                    outputs['forecast'],
-                    targets,
-                    posterior_probs=posterior_probs,
-                    stage=stage
-                )
+                if stage == 'stage2':
+                    # For Stage 2 validation, we need both prior and posterior to compute KL divergence
+                    # Even though we're validating, we can use targets (future observations) to compute
+                    # the posterior, since we're just evaluating, not training
+                    
+                    # Compute prior probabilities
+                    emission_mu_for_prior = emission_mu.permute(1, 2, 0)  # (batch, horizon, n_states)
+                    init_probs, trans_matrices = self.model.hmm_gating.get_prior_components(
+                        x_past=inputs,
+                        x_future=emission_mu_for_prior
+                    )
+                    
+                    # Build prior probabilities (same as in training)
+                    batch_size = inputs.shape[0]
+                    prior_probs_list = [init_probs]
+                    for t in range(1, self.model.output_dim):
+                        prev_probs = prior_probs_list[-1].unsqueeze(1)  # (batch, 1, n_states)
+                        trans_matrix = trans_matrices[:, t-1, :, :]  # (batch, n_states, n_states)
+                        next_probs = torch.bmm(prev_probs, trans_matrix).squeeze(1)  # (batch, n_states)
+                        prior_probs_list.append(next_probs)
+                    prior_probs = torch.stack(prior_probs_list, dim=1)  # (batch, horizon, n_states)
+                    
+                    # Compute posterior probabilities using future observations (targets)
+                    future_obs = targets.unsqueeze(-1)  # (batch, horizon, 1)
+                    posterior_probs = self.model.hmm_gating(
+                        x_past=inputs,
+                        x_future=future_obs,
+                        mode='posterior'
+                    )  # (batch, horizon, n_states)
+                    
+                    # Compute log probabilities
+                    prior_logp = torch.log(prior_probs + 1e-8)  # (batch, horizon, n_states)
+                    posterior_logp = torch.log(posterior_probs + 1e-8)  # (batch, horizon, n_states)
+                    
+                    # Get model outputs for metrics
+                    outputs = self.model(inputs, parametric_forecast=parametric_forecasts)
+                    
+                    # Compute loss with prior and posterior log probabilities
+                    loss_dict = self.loss_fn(
+                        emission_mu,
+                        emission_sigma,
+                        targets,
+                        prior_logp=prior_logp,
+                        posterior_logp=posterior_logp,
+                        posterior_probs=posterior_probs,
+                        stage=stage
+                    )
+                else:
+                    # Stage 1 validation: use prior (no future observations available)
+                    outputs = self.model(inputs, parametric_forecast=parametric_forecasts)
+                    posterior_probs = outputs['state_probs']  # (batch, horizon, n_states)
+                    
+                    loss_dict = self.loss_fn(
+                        emission_mu,
+                        emission_sigma,
+                        targets,
+                        posterior_probs=posterior_probs,
+                        stage=stage
+                    )
                 
                 val_losses.append(loss_dict['total_loss'].item())
                 
@@ -383,15 +642,24 @@ class DELPHITrainer:
         
         torch.save(checkpoint, filepath)
         
-        if is_best:
-            best_path = str(Path(filepath).parent / 'best_model.pt')
-            torch.save(checkpoint, best_path)
+        # Note: Best model checkpoints are saved explicitly in train_stage1/train_stage2
+        # with specific names (best_model_stage1.pt, best_model_stage2.pt)
+        # The is_best flag is kept for compatibility but doesn't create additional files
     
-    def load_checkpoint(self, filepath: str):
+    def load_checkpoint(self, filepath: str) -> Dict:
         """Load model checkpoint."""
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.history = checkpoint.get('history', self.history)
-        return checkpoint['epoch']
+        
+        # Restore best epoch info if available
+        if 'history' in checkpoint and 'stage1' in checkpoint['history']:
+            val_losses = checkpoint['history']['stage1'].get('val_loss', [])
+            if val_losses:
+                best_idx = np.argmin(val_losses)
+                self.best_epoch_stage1 = best_idx + 1
+                self.best_val_loss_stage1 = val_losses[best_idx]
+        
+        return checkpoint  # Return full checkpoint dict
 
