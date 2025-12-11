@@ -325,8 +325,7 @@ def main():
         'reseasonalization_info': [],
         'scale_comparisons': [],
         'mase_components': [],
-        'scale_analysis': [],  # New: detailed scale diagnostics
-        'scale_corrections_applied': 0  # Count of series with scale corrections
+        'scale_analysis': []  # Detailed scale diagnostics
     }
     
     for idx, series_id in enumerate(eval_series, 1):
@@ -386,39 +385,8 @@ def main():
             parametric_forecast=param_forecast
         )
         
-        # Get deseasonalized forecast (original scale from model)
-        deseasonalized_forecast_original = result['forecast'].flatten()
-        
-        # Check for scale mismatch: compare deseasonalized forecast scale with training history scale
-        # Use training statistics to compute correction factor (avoid data leakage)
-        scale_correction_needed = False
-        scale_correction_factor = 1.0
-        
-        if len(train_history) > 0 and len(deseasonalized_forecast_original) > 0:
-            train_mean = np.mean(np.abs(train_history))
-            pred_mean = np.mean(np.abs(deseasonalized_forecast_original))
-            
-            if train_mean > 1e-8 and pred_mean > 1e-8:
-                scale_ratio = pred_mean / train_mean
-                # If scale differs by more than 2x, apply correction based on training scale
-                if scale_ratio > 2.0 or scale_ratio < 0.5:
-                    scale_correction_needed = True
-                    scale_correction_factor = train_mean / pred_mean
-                    # Additionally check if test sequence scale matches training scale
-                    if len(test_sequence) > 0:
-                        test_mean = np.mean(np.abs(test_sequence))
-                        if test_mean > 1e-8:
-                            train_test_ratio = train_mean / test_mean
-                            # If training and test scales also differ significantly, use test scale
-                            # (This indicates a real scale mismatch in the data)
-                            if train_test_ratio > 1.5 or train_test_ratio < 0.67:
-                                scale_correction_factor = test_mean / pred_mean
-        
-        # Apply scale correction if needed
-        deseasonalized_forecast = deseasonalized_forecast_original * scale_correction_factor if scale_correction_needed else deseasonalized_forecast_original
-        
-        if scale_correction_needed:
-            diagnostic_data['scale_corrections_applied'] += 1
+        # Get deseasonalized forecast from model (on deseasonalized scale)
+        deseasonalized_forecast = result['forecast'].flatten()
         
         # Re-seasonalize forecast for MASE computation (evaluated on original scale)
         # Get seasonal components from test split
@@ -482,21 +450,16 @@ def main():
             if true_mean > 1e-6:
                 scale_ratio = pred_mean / true_mean
                 if scale_ratio < 0.1 or scale_ratio > 10:
-                    if scale_correction_needed:
-                        validation_errors.append(f"Scale mismatch after correction: pred/true ratio = {scale_ratio:.4f} (correction factor: {scale_correction_factor:.4f})")
-                    else:
-                        validation_errors.append(f"Scale mismatch: pred/true ratio = {scale_ratio:.4f}")
+                    validation_errors.append(f"Scale mismatch: pred/true ratio = {scale_ratio:.4f}")
         
-        # Check 2b: Deseasonalized forecast should match test sequence scale (after correction)
+        # Check 2b: Deseasonalized forecast should match test sequence scale
         if len(test_sequence) == len(deseasonalized_forecast):
             test_mean = np.mean(np.abs(test_sequence))
             pred_mean = np.mean(np.abs(deseasonalized_forecast))
             if test_mean > 1e-6:
                 scale_ratio = pred_mean / test_mean
-                if scale_correction_needed and (scale_ratio < 0.8 or scale_ratio > 1.2):
-                    validation_errors.append(f"Scale correction may be insufficient: pred/test deseasonalized ratio = {scale_ratio:.4f}")
-                elif not scale_correction_needed and (scale_ratio < 0.5 or scale_ratio > 2.0):
-                    validation_errors.append(f"Potential scale mismatch detected: pred/test deseasonalized ratio = {scale_ratio:.4f} (consider enabling scale correction)")
+                if scale_ratio < 0.5 or scale_ratio > 2.0:
+                    validation_errors.append(f"Potential scale mismatch detected: pred/test deseasonalized ratio = {scale_ratio:.4f}")
         
         # Check 3: Re-seasonalized forecast = deseasonalized + seasonal (should be exact)
         recomputed = deseasonalized_forecast + seasonal_components_forecast
@@ -567,13 +530,7 @@ def main():
                 },
                 'tbats_forecast_stats': param_forecast_stats,
                 'model_correction_stats': correction_stats,
-                'deseasonalized_forecast_stats_original': {
-                    'mean': np.mean(deseasonalized_forecast_original),
-                    'std': np.std(deseasonalized_forecast_original),
-                    'min': np.min(deseasonalized_forecast_original),
-                    'max': np.max(deseasonalized_forecast_original)
-                },
-                'deseasonalized_forecast_stats_corrected': {
+                'deseasonalized_forecast_stats': {
                     'mean': np.mean(deseasonalized_forecast),
                     'std': np.std(deseasonalized_forecast),
                     'min': np.min(deseasonalized_forecast),
@@ -585,11 +542,8 @@ def main():
                     'min': np.min(seasonal_components_forecast),
                     'max': np.max(seasonal_components_forecast)
                 },
-                'scale_correction_applied': scale_correction_needed,
-                'scale_correction_factor': scale_correction_factor,
                 'scale_ratios': {
-                    'pred_to_test_deseasonalized_before_correction': np.mean(deseasonalized_forecast_original) / (np.mean(test_sequence) + 1e-8),
-                    'pred_to_test_deseasonalized_after_correction': np.mean(deseasonalized_forecast) / (np.mean(test_sequence) + 1e-8),
+                    'pred_to_test_deseasonalized': np.mean(deseasonalized_forecast) / (np.mean(test_sequence) + 1e-8),
                     'pred_to_test_original': np.mean(reseasonalized_forecast) / (np.mean(orig_test_sequence) + 1e-8),
                     'train_deseasonalized_to_original': train_history_stats['mean'] / (orig_train_stats['mean'] + 1e-8) if orig_train_stats['mean'] > 1e-8 else np.nan,
                     'test_deseasonalized_to_original': np.mean(test_sequence) / (np.mean(orig_test_sequence) + 1e-8)
@@ -625,11 +579,6 @@ def main():
     
     # Compute metrics on original scale
     # All metrics (MSE, MAE, MASE) should be computed on original scale for fair comparison
-    # Summary of scale corrections
-    if diagnostic_data['scale_corrections_applied'] > 0:
-        print(f"\nScale Corrections Applied: {diagnostic_data['scale_corrections_applied']} out of {len(eval_series)} series")
-        print("  (Scale mismatch detected and corrected)")
-    
     print("\n" + "="*70)
     print("EVALUATION METRICS")
     print("="*70)
@@ -727,10 +676,7 @@ def main():
             print(f"    Original Test: mean={diag['original_test_stats']['mean']:.6f}, std={diag['original_test_stats']['std']:.6f}")
             print(f"    TBATS Forecast: mean={diag['tbats_forecast_stats']['mean']:.6f}, std={diag['tbats_forecast_stats']['std']:.6f}")
             print(f"    Model Correction: mean={diag['model_correction_stats']['mean']:.6f}, std={diag['model_correction_stats']['std']:.6f}")
-            print(f"    Model Forecast (deseasonalized, original): mean={diag['deseasonalized_forecast_stats_original']['mean']:.6f}")
-            if diag.get('scale_correction_applied', False):
-                print(f"    Scale Correction Applied: YES (factor={diag.get('scale_correction_factor', 1.0):.4f})")
-                print(f"    Model Forecast (deseasonalized, corrected): mean={diag['deseasonalized_forecast_stats_corrected']['mean']:.6f}")
+            print(f"    Model Forecast (deseasonalized): mean={diag['deseasonalized_forecast_stats']['mean']:.6f}")
             print(f"    Scale Ratios:")
             for key, val in diag['scale_ratios'].items():
                 if not np.isnan(val) and not np.isinf(val):

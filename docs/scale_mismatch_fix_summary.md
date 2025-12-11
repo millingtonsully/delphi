@@ -1,8 +1,10 @@
 # Scale Mismatch Fix - Implementation Summary
 
+**Note: Scale correction was removed as unnecessary. Findings showed 0/100 series required correction. The data flow is correct: TBATS on deseasonalized → model on deseasonalized → re-seasonalize. No scale correction needed.**
+
 ## Problem Identified
 
-Diagnostics revealed a critical 10-12x scale mismatch:
+Initial diagnostics revealed a potential 10-12x scale mismatch:
 - Model predictions: ~0.116 mean (on deseasonalized scale)
 - True values: ~0.009-0.013 mean (on original scale)
 - This caused MASE to be extremely high (29.67)
@@ -36,39 +38,34 @@ The scale mismatch occurs because:
 - JSON file with detailed scale diagnostics
 - Identifies exactly where scale mismatch occurs
 
-### 2. Automatic Scale Correction
+### 2. Automatic Scale Correction (REMOVED)
 
-**Implementation:**
-- Detects scale mismatch by comparing:
-  - Model predictions vs training history scale
-  - Training vs test scale (if they differ)
-- Applies scale correction factor when mismatch > 2x
-- Uses training statistics to avoid data leakage
-- Falls back to test statistics if training/test scales also differ significantly
+**Status: REMOVED - Unnecessary**
 
-**Logic:**
-```python
-if scale_ratio > 2.0 or scale_ratio < 0.5:
-    scale_correction_needed = True
-    scale_correction_factor = training_mean / prediction_mean
-    deseasonalized_forecast *= scale_correction_factor
-```
+Scale correction was implemented but never actually applied (0/100 series). Further investigation revealed:
+- Data flow is correct: TBATS on deseasonalized → model on deseasonalized → re-seasonalize
+- Model architecture only clamps at [-5, 5], which is reasonable for deseasonalized data
+- Original 10-12x mismatch issue not present in current results
+- Scale correction is unnecessary and has been removed from the codebase
+
+**Previous Implementation (removed):**
+- Would detect scale mismatch by comparing model predictions vs training history scale
+- Would apply scale correction factor when mismatch > 2x
+- Used training statistics to avoid data leakage
 
 ### 3. Enhanced Validation Checks
 
 **Added checks:**
 - Scale mismatch detection (pred/true ratio)
-- Scale correction effectiveness verification
-- Warnings when correction might be insufficient
 - Validation messages for first few series
+- Scale consistency checks between deseasonalized and re-seasonalized forecasts
 
 ## Files Modified
 
 1. **`delphi/evaluation/evaluate.py`**
    - Added scale analysis diagnostics
-   - Implemented automatic scale correction
    - Enhanced validation checks
-   - Added scale correction summary output
+   - Scale correction was removed as unnecessary (0/100 series required it)
 
 2. **`delphi/evaluation/metrics.py`**
    - Already enhanced with diagnostic output (from previous fix)
@@ -80,10 +77,9 @@ if scale_ratio > 2.0 or scale_ratio < 0.5:
 
 With these fixes:
 
-1. **Scale Correction**: Predictions will be automatically scaled to match the correct scale
-2. **Better Diagnostics**: Can identify exactly where scale issues occur
-3. **Improved MASE**: Should see significant improvement in MASE as predictions are now on correct scale
-4. **Validation**: Automatic checks catch scale issues and verify corrections work
+1. **Scale Diagnostics**: Can identify exactly where scale issues occur (scale correction removed as unnecessary)
+2. **Improved MASE**: MASE improvements come from proper re-seasonalization, not scale correction
+3. **Validation**: Automatic checks catch scale issues for diagnostic purposes
 
 ## Testing
 
@@ -93,14 +89,20 @@ python -m delphi.evaluation.evaluate --model_path checkpoints/delphi_final.pt
 ```
 
 **Check for:**
-- Scale correction summary showing how many series were corrected
 - Detailed scale analysis output
 - Improved MASE score (should be much lower than 29.67)
 - Validation warnings (should be reduced)
+- Note: Scale correction is no longer applied (was found to be unnecessary)
 
-## Next Steps if Issues Persist
+## Current Status
 
-If scale correction doesn't fully resolve the issue:
+Scale correction has been removed as unnecessary. The evaluation pipeline works correctly:
+- TBATS fits on deseasonalized data
+- Model predicts on deseasonalized scale
+- Re-seasonalization restores original scale
+- No scale correction needed (0/100 series required it)
+
+If scale issues persist in the future:
 
 1. **Check Training Data Scale**: Verify training targets are at same scale as evaluation
 2. **Investigate TBATS**: Check if TBATS forecasts are on correct scale
