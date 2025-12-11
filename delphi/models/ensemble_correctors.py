@@ -223,7 +223,9 @@ class DeepEnsembleCorrectors(nn.Module):
         """
         super().__init__()
         
-        self.n_members = 4  # Fixed to match 4 HMM states
+        # Validate that n_members equals 4 (fixed to match 4 specialized correctors)
+        assert n_members == 4, f"n_members must be 4 (got {n_members}). This is fixed to match the 4 specialized correctors."
+        self.n_members = n_members
         self.output_dim = output_dim
         
         # Create 4 specialized correctors (1:1 mapping with HMM states)
@@ -234,6 +236,10 @@ class DeepEnsembleCorrectors(nn.Module):
             VolatilityShiftCorrectorRNN(input_dim, hidden_size, num_layers, output_dim, dropout),
             ExternalSignalSpecialist(input_dim, hidden_size, num_layers, output_dim, dropout)
         ])
+        
+        # Validate that number of correctors matches n_members
+        assert len(self.correctors) == self.n_members, \
+            f"Number of correctors ({len(self.correctors)}) must match n_members ({self.n_members})"
     
     def forward(
         self,

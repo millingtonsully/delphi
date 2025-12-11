@@ -30,7 +30,7 @@ class DELPHICore(nn.Module):
         ensemble_hidden_size: int = 64,
         ensemble_num_layers: int = 2,
         output_dim: int = 26,  # Forecast horizon
-        n_ensemble_members: int = 5,
+        n_ensemble_members: int = 4,
         dropout: float = 0.2
     ):
         """
@@ -44,7 +44,7 @@ class DELPHICore(nn.Module):
             ensemble_hidden_size: Ensemble xLSTM hidden size
             ensemble_num_layers: Ensemble xLSTM layers
             output_dim: Forecast horizon
-            n_ensemble_members: Number of ensemble members (M=5)
+            n_ensemble_members: Number of ensemble members (M=4, must match n_states)
             dropout: Dropout rate
         """
         super().__init__()
@@ -52,6 +52,9 @@ class DELPHICore(nn.Module):
         self.input_dim = input_dim
         self.n_states = n_states
         self.output_dim = output_dim
+        
+        # Validate that n_states equals n_ensemble_members for proper 1:1 routing
+        assert n_states == n_ensemble_members, f"n_states ({n_states}) must equal n_ensemble_members ({n_ensemble_members})"
         
         # Variational HMM Gating (xLSTM-based)
         self.hmm_gating = VariationalHMMGating(
@@ -139,12 +142,17 @@ class DELPHICore(nn.Module):
                 mode='posterior'
             )  # (batch, output_dim, n_states)
             
-            # Sample states from posterior per timestep
-            # For each timestep, sample from categorical distribution
-            states = torch.zeros(batch_size, self.output_dim, dtype=torch.long, device=x.device)
-            for t in range(self.output_dim):
-                probs_t = state_probs[:, t, :]  # (batch, n_states)
-                states[:, t] = torch.multinomial(probs_t, 1).squeeze(-1)
+            # Select states: random sampling during training, deterministic argmax during validation/inference
+            if self.training:
+                # Training: use random sampling from posterior (for training dynamics)
+                # For each timestep, sample from categorical distribution
+                states = torch.zeros(batch_size, self.output_dim, dtype=torch.long, device=x.device)
+                for t in range(self.output_dim):
+                    probs_t = state_probs[:, t, :]  # (batch, n_states)
+                    states[:, t] = torch.multinomial(probs_t, 1).squeeze(-1)
+            else:
+                # Validation/Inference: use deterministic argmax for reproducible metrics
+                states = torch.argmax(state_probs, dim=-1)  # (batch, output_dim)
         else:
             # Use prior with emission predictions (when future_observations not available)
             # Get state probabilities from prior

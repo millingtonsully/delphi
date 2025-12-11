@@ -525,17 +525,17 @@ class DELPHITrainer:
                 if parametric_forecasts is not None:
                     parametric_forecasts = parametric_forecasts.to(self.device)
                 
-                # Get emission mu and sigma first (needed for both prior and posterior)
-                all_mus = []
-                all_sigmas = []
-                for corrector in self.model.ensemble.correctors:
-                    mu, sigma = corrector(inputs)
-                    all_mus.append(mu)
-                    all_sigmas.append(sigma)
-                emission_mu = torch.stack(all_mus, dim=0)  # (n_states, batch, horizon)
-                emission_sigma = torch.stack(all_sigmas, dim=0)  # (n_states, batch, horizon)
-                
                 if stage == 'stage2':
+                    # For Stage 2 validation, we need emissions computed separately for both prior and posterior
+                    # Get emission mu and sigma first (needed for both prior and posterior)
+                    all_mus = []
+                    all_sigmas = []
+                    for corrector in self.model.ensemble.correctors:
+                        mu, sigma = corrector(inputs)
+                        all_mus.append(mu)
+                        all_sigmas.append(sigma)
+                    emission_mu = torch.stack(all_mus, dim=0)  # (n_states, batch, horizon)
+                    emission_sigma = torch.stack(all_sigmas, dim=0)  # (n_states, batch, horizon)
                     # For Stage 2 validation, we need both prior and posterior to compute KL divergence
                     # Even though we're validating, we can use targets (future observations) to compute
                     # the posterior, since we're just evaluating, not training
@@ -583,8 +583,17 @@ class DELPHITrainer:
                         stage=stage
                     )
                 else:
-                    # Stage 1 validation: use prior (no future observations available)
-                    outputs = self.model(inputs, parametric_forecast=parametric_forecasts)
+                    # Stage 1 validation: use posterior with future observations (same as training)
+                    # This ensures proper ELBO loss computation during Stage 1 validation
+                    future_obs = targets.unsqueeze(-1)  # (batch, horizon, 1)
+                    outputs = self.model(
+                        inputs, 
+                        parametric_forecast=parametric_forecasts,
+                        future_observations=future_obs
+                    )
+                    # Use emissions from model forward pass (avoids redundant computation)
+                    emission_mu = outputs['emission_mu']  # (n_states, batch, horizon)
+                    emission_sigma = outputs['emission_sigma']  # (n_states, batch, horizon)
                     posterior_probs = outputs['state_probs']  # (batch, horizon, n_states)
                     
                     loss_dict = self.loss_fn(
