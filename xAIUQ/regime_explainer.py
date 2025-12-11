@@ -68,30 +68,42 @@ class RegimeExplainer:
             for b in range(batch_size):
                 prev_state = None
                 duration = 0
+                state_start = 0  # Track when current state started
                 
                 for t in range(horizon):
-                    curr_state = states[b, t].item()
+                    curr_state = int(states[b, t].item())  # Ensure integer
                     activation_counts[curr_state] += 1
                     
-                    if prev_state is None or prev_state == curr_state:
+                    if prev_state is None:
+                        # First timestep: initialize
+                        prev_state = curr_state
+                        duration = 1
+                        state_start = t
+                    elif prev_state == curr_state:
+                        # Same state: increment duration
                         duration += 1
                     else:
-                        if prev_state is not None:
-                            state_durations.append({
-                                'state': prev_state.item() if isinstance(prev_state, torch.Tensor) else prev_state,
-                                'duration': duration,
-                                'timestep_start': t - duration
-                            })
+                        # State changed: record previous state duration
+                        state_durations.append({
+                            'state': prev_state,
+                            'duration': duration,
+                            'timestep_start': state_start,
+                            'timestep_end': t - 1,
+                            'batch_idx': b
+                        })
+                        # Start tracking new state
+                        prev_state = curr_state
                         duration = 1
-                    
-                    prev_state = curr_state
+                        state_start = t
                 
-                # Add final duration
+                # Record final state duration (always exists since horizon > 0)
                 if prev_state is not None:
                     state_durations.append({
-                        'state': prev_state.item() if isinstance(prev_state, torch.Tensor) else prev_state,
+                        'state': prev_state,
                         'duration': duration,
-                        'timestep_start': horizon - duration
+                        'timestep_start': state_start,
+                        'timestep_end': horizon - 1,
+                        'batch_idx': b
                     })
             
             # Compute activation statistics

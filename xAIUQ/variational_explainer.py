@@ -97,12 +97,17 @@ class VariationalExplainer:
             regime_info = model.get_regime_explanation(x)
             transition_matrices = regime_info.get('transition_matrices')
             
+            # Safely convert transition matrices to numpy if available
+            transition_matrices_np = None
+            if transition_matrices is not None:
+                transition_matrices_np = transition_matrices.cpu().numpy()
+            
             return {
                 'state_probs': state_probs.cpu().numpy(),
                 'dominant_states': dominant_states.cpu().numpy(),
                 'regime_transitions': transition_probs.cpu().numpy(),
                 'shift_probabilities': shift_probabilities.cpu().numpy(),
-                'transition_matrices': transition_matrices.cpu().numpy() if transition_matrices is not None else None,
+                'transition_matrices': transition_matrices_np,
                 'state_names': self.state_names,
                 'horizon': horizon
             }

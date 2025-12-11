@@ -106,42 +106,49 @@ class UncertaintyQuantifier:
         mean_forecast = samples.mean(dim=0)  # (batch, horizon)
         std_forecast = samples.std(dim=0)  # (batch, horizon)
         
-        # Decompose uncertainty
-        # Epistemic: variance of means across state samples
-        # Aleatoric: mean of variances from emission distributions
+        # Decompose uncertainty using proper UQ theory:
+        # - Epistemic: Var(E[y | z_1:T]) - variance of mean predictions across state trajectories
+        # - Aleatoric: E[Var(y | z_1:T)] - expected variance given states
         
         # Get state probabilities for weighted averaging
         with torch.no_grad():
             results = model(x, parametric_forecast=parametric_forecast)
             state_probs = results['state_probs']  # (batch, horizon, n_states)
         
-        # Aleatoric uncertainty: weighted average of emission sigmas
-        aleatoric_uncertainty = torch.zeros(batch_size, horizon, device=x.device)
+        # Compute mean predictions for each trajectory (without aleatoric noise)
+        # This requires recomputing forecasts without sampling noise
+        trajectory_means = []
+        for i in range(num_samples):
+            states = state_samples[i]  # (batch, horizon)
+            # Get correction means (without noise) for this trajectory
+            correction_mu, _ = model.ensemble(x, states=states)
+            if parametric_forecast is not None:
+                trajectory_mean = parametric_forecast + correction_mu
+            else:
+                trajectory_mean = correction_mu
+            trajectory_means.append(trajectory_mean)
+        
+        trajectory_means = torch.stack(trajectory_means, dim=0)  # (num_samples, batch, horizon)
+        
+        # Epistemic uncertainty: variance of mean predictions across trajectories
+        # Var(E[y | z_1:T]) = variance across trajectories
+        epistemic_uncertainty = trajectory_means.std(dim=0)  # (batch, horizon)
+        
+        # Aleatoric uncertainty: expected variance given states
+        # E[Var(y | z_1:T)] = weighted average of emission variances
+        aleatoric_variance = torch.zeros(batch_size, horizon, device=x.device)
         for k in range(model.n_states):
             prob_k = state_probs[:, :, k]  # (batch, horizon)
             sigma_k = emission_sigma[k]  # (batch, horizon)
-            aleatoric_uncertainty += prob_k * (sigma_k ** 2)
-        aleatoric_uncertainty = torch.sqrt(aleatoric_uncertainty)
+            aleatoric_variance += prob_k * (sigma_k ** 2)
+        aleatoric_uncertainty = torch.sqrt(aleatoric_variance)  # (batch, horizon)
         
-        # Epistemic uncertainty: variance across state trajectories
-        # Compute variance of means for different state sequences
-        state_means = []
-        for k in range(model.n_states):
-            # Mean forecast when state k is active
-            mask = (state_samples == k).float()  # (num_samples, batch, horizon)
-            if mask.sum() > 0:
-                # Weighted mean for state k
-                state_mean = (samples * mask).sum(dim=0) / (mask.sum(dim=0) + 1e-8)
-                state_means.append(state_mean * state_probs[:, :, k])
+        # Verify: total uncertainty should approximately equal sqrt(epistemic^2 + aleatoric^2)
+        # Note: This is approximate due to sampling, but should be close
+        total_uncertainty_approx = torch.sqrt(epistemic_uncertainty ** 2 + aleatoric_uncertainty ** 2)
         
-        if state_means:
-            weighted_mean = torch.stack(state_means, dim=0).sum(dim=0)
-            epistemic_uncertainty = std_forecast  # Approximate as total - aleatoric
-        else:
-            epistemic_uncertainty = std_forecast
-        
-        # Ensure epistemic is non-negative
-        epistemic_uncertainty = torch.clamp(epistemic_uncertainty - aleatoric_uncertainty, min=0.0)
+        # Ensure epistemic is non-negative (should already be, but safety check)
+        epistemic_uncertainty = torch.clamp(epistemic_uncertainty, min=0.0)
         
         return {
             'mean_forecast': mean_forecast.cpu().numpy(),
@@ -217,19 +224,23 @@ class UncertaintyQuantifier:
         Returns:
             Dictionary with confidence intervals
         """
-        # Get uncertainty decomposition
+        # Get uncertainty decomposition (keep in torch tensors)
         uncertainty_results = self.decompose_uncertainty(model, x, parametric_forecast)
         
-        mean_forecast = torch.tensor(uncertainty_results['mean_forecast'])
-        total_uncertainty = torch.tensor(uncertainty_results['total_uncertainty'])
+        # Convert numpy results back to torch tensors (matching device)
+        mean_forecast = torch.tensor(uncertainty_results['mean_forecast'], device=x.device)
+        total_uncertainty = torch.tensor(uncertainty_results['total_uncertainty'], device=x.device)
         
-        # Get regime uncertainty
+        # Get regime uncertainty (keep in torch tensors)
         with torch.no_grad():
             results = model(x, parametric_forecast=parametric_forecast)
-            state_probs = torch.tensor(results['state_probs'])
+            state_probs = results['state_probs']  # Already a torch tensor
         
         regime_uncertainty_results = self.regime_uncertainty(state_probs)
-        regime_uncertainty = torch.tensor(regime_uncertainty_results['normalized_uncertainty'])
+        regime_uncertainty = torch.tensor(
+            regime_uncertainty_results['normalized_uncertainty'], 
+            device=x.device
+        )
         
         # Adjust confidence intervals based on regime uncertainty
         # Higher regime uncertainty -> wider intervals

@@ -141,10 +141,26 @@ class CausalAnalyzer:
         
         # Correlation between weak signal and causal effect
         weak_signal_values = x[:, -1, 1].unsqueeze(1).expand(-1, causal_effect.shape[1])  # (batch, horizon)
-        correlation = torch.corrcoef(torch.stack([
-            weak_signal_values.flatten(),
-            causal_effect.flatten()
-        ]))[0, 1].item() if causal_effect.numel() > 1 else 0.0
+        weak_signal_flat = weak_signal_values.flatten()
+        causal_effect_flat = causal_effect.flatten()
+        
+        # Compute correlation with proper edge case handling
+        if causal_effect_flat.numel() < 2:
+            correlation = 0.0
+        else:
+            # Stack as (2, N) for torch.corrcoef: rows are variables, columns are observations
+            stacked = torch.stack([weak_signal_flat, causal_effect_flat], dim=0)  # (2, N)
+            
+            # Check for constant values (zero variance)
+            if stacked.std(dim=1).min() < 1e-8:
+                correlation = 0.0
+            else:
+                corr_matrix = torch.corrcoef(stacked)  # (2, 2)
+                correlation = corr_matrix[0, 1].item()
+                
+                # Handle NaN (can occur with numerical issues)
+                if torch.isnan(torch.tensor(correlation)):
+                    correlation = 0.0
         
         return {
             'causal_effect': causal_effect.cpu().numpy(),

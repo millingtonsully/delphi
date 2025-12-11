@@ -138,11 +138,13 @@ class TimeSeriesFeatureAttribution:
         batch_size, seq_len, n_features = x.shape
         horizon = forecast.shape[1]
         
-        # Compute gradients for each feature
+        # Compute gradients for each horizon timestep separately
+        # This preserves per-timestep attribution information
         feature_attributions = torch.zeros(batch_size, seq_len, n_features, horizon, device=x.device)
         
         for t in range(horizon):
-            # Gradient w.r.t. input for each timestep
+            # Gradient w.r.t. input for forecast at timestep t
+            # Sum over batch to get scalar output for gradient computation
             grad = torch.autograd.grad(
                 outputs=forecast[:, t].sum(),
                 inputs=x,
@@ -152,16 +154,22 @@ class TimeSeriesFeatureAttribution:
             
             feature_attributions[:, :, :, t] = grad
         
-        # Average over batch
+        # Average over batch to get per-timestep attributions
         attributions = feature_attributions.mean(dim=0)  # (seq_len, n_features, horizon)
         
-        # Compute feature importance (sum over time and horizon)
+        # Compute overall feature importance (aggregated over time and horizon)
         feature_importance = torch.abs(attributions).sum(dim=(0, 2))  # (n_features,)
         feature_importance = feature_importance / (feature_importance.sum() + 1e-8)  # Normalize
         
+        # Compute per-timestep feature importance (aggregated over input sequence)
+        # Shape: (horizon, n_features) - shows which features matter most at each forecast timestep
+        per_timestep_importance = torch.abs(attributions).sum(dim=0)  # (n_features, horizon)
+        per_timestep_importance = per_timestep_importance / (per_timestep_importance.sum(dim=0, keepdim=True) + 1e-8)  # Normalize per timestep
+        
         return {
-            'shap_values': attributions.cpu().numpy(),
-            'feature_importance': feature_importance.cpu().numpy(),
+            'shap_values': attributions.cpu().numpy(),  # (seq_len, n_features, horizon) - full attribution
+            'feature_importance': feature_importance.cpu().numpy(),  # (n_features,) - overall importance
+            'per_timestep_importance': per_timestep_importance.cpu().numpy(),  # (n_features, horizon) - per forecast timestep
             'feature_names': self.feature_names,
             'attribution_shape': attributions.shape
         }
