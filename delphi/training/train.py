@@ -435,22 +435,28 @@ def main():
     )
     
     # Initialize trainer
+    training_cfg = config['training']
     trainer = DELPHITrainer(
         model=model,
         device=device,
-        learning_rate=config['training']['learning_rate'],
-        weight_decay=config['training']['weight_decay'],
-        kl_weight=config['training']['kl_weight'],
-        entropy_weight=config['training']['entropy_weight'],
-        stage1_epochs=config['training']['stage1_epochs'],
-        stage2_epochs=config['training']['stage2_epochs'],
-        kl_anneal=config['training']['kl_anneal'],
-        kl_start=config['training']['kl_start'],
-        kl_end=config['training']['kl_end'],
-        kl_warmup_epochs=config['training']['kl_warmup_epochs'],
-        early_stopping_patience=config['training']['early_stopping_patience'],
-        early_stopping_min_delta=config['training']['early_stopping_min_delta'],
-        checkpoint_dir=str(save_dir)
+        learning_rate=training_cfg['learning_rate'],
+        weight_decay=training_cfg['weight_decay'],
+        kl_weight=training_cfg['kl_weight'],
+        entropy_weight=training_cfg['entropy_weight'],
+        stage1_epochs=training_cfg['stage1_epochs'],
+        stage2_epochs=training_cfg['stage2_epochs'],
+        kl_anneal=training_cfg['kl_anneal'],
+        kl_start=training_cfg['kl_start'],
+        kl_end=training_cfg['kl_end'],
+        kl_warmup_epochs=training_cfg['kl_warmup_epochs'],
+        early_stopping_patience=training_cfg['early_stopping_patience'],
+        early_stopping_min_delta=training_cfg['early_stopping_min_delta'],
+        checkpoint_dir=str(save_dir),
+        use_scheduler=training_cfg.get('use_scheduler', True),
+        scheduler_patience=training_cfg.get('scheduler_patience', 5),
+        scheduler_factor=training_cfg.get('scheduler_factor', 0.5),
+        scheduler_min_lr=training_cfg.get('scheduler_min_lr', 1e-6),
+        use_amp=training_cfg.get('use_amp', True)
     )
     
     # Stage 1 checkpoint paths

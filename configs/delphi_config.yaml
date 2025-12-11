@@ -58,6 +58,15 @@ training:
   kl_end: 0.1
   kl_warmup_epochs: 10
   
+  # Learning rate scheduler
+  use_scheduler: true
+  scheduler_patience: 5  # Epochs to wait before reducing LR
+  scheduler_factor: 0.5  # Factor to multiply LR by when reducing
+  scheduler_min_lr: 1e-6  # Minimum learning rate
+  
+  # Mixed precision training (AMP)
+  use_amp: true  # Enable automatic mixed precision for faster training
+  
   # Checkpointing
   save_dir: "checkpoints"
   log_dir: "logs"

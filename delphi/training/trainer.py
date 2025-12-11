@@ -5,6 +5,8 @@ Training utilities for DELPHI: Two-stage ELBO training.
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim import lr_scheduler
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Dataset
 from typing import Dict, Optional, List
 import numpy as np
@@ -74,7 +76,12 @@ class DELPHITrainer:
         kl_warmup_epochs: int = 0,
         early_stopping_patience: int = 10,
         early_stopping_min_delta: float = 1e-4,
-        checkpoint_dir: Optional[str] = None
+        checkpoint_dir: Optional[str] = None,
+        use_scheduler: bool = True,
+        scheduler_patience: int = 5,
+        scheduler_factor: float = 0.5,
+        scheduler_min_lr: float = 1e-6,
+        use_amp: bool = True
     ):
         """
         Initialize DELPHI trainer.
@@ -91,12 +98,18 @@ class DELPHITrainer:
             early_stopping_patience: Number of epochs to wait before stopping if no improvement
             early_stopping_min_delta: Minimum change to qualify as an improvement
             checkpoint_dir: Directory to save checkpoints (for best model)
+            use_scheduler: Whether to use learning rate scheduler
+            scheduler_patience: Patience for ReduceLROnPlateau scheduler
+            scheduler_factor: Factor to multiply LR by when reducing
+            scheduler_min_lr: Minimum learning rate
+            use_amp: Whether to use mixed precision training (AMP)
         """
         self.model = model.to(device)
         self.device = device
         self.stage1_epochs = stage1_epochs
         self.stage2_epochs = stage2_epochs
         self.base_kl_weight = kl_weight
+        self.weight_decay = weight_decay
 
         # KL annealing configuration
         self.kl_anneal = kl_anneal
@@ -118,11 +131,35 @@ class DELPHITrainer:
         self.best_epoch_stage2 = 0
         
         # Optimizers
-        self.optimizer = optim.Adam(
+        self.optimizer = optim.AdamW(
             model.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay
         )
+        
+        # Learning rate scheduler
+        self.use_scheduler = use_scheduler
+        self.scheduler_factor = scheduler_factor
+        self.scheduler_patience = scheduler_patience
+        self.scheduler_min_lr = scheduler_min_lr
+        if use_scheduler:
+            self.scheduler = lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=scheduler_factor,
+                patience=scheduler_patience,
+                min_lr=scheduler_min_lr,
+                verbose=True
+            )
+        else:
+            self.scheduler = None
+        
+        # Mixed precision training (AMP)
+        self.use_amp = use_amp and device.startswith('cuda') and torch.cuda.is_available()
+        if self.use_amp:
+            self.scaler = GradScaler()
+        else:
+            self.scaler = None
         
         # Loss functions
         self.loss_fn = CombinedLoss(
@@ -231,35 +268,45 @@ class DELPHITrainer:
                 # Forward pass with future observations for posterior
                 # Reshape targets to (batch, horizon, 1) for posterior
                 future_obs = targets.unsqueeze(-1)  # (batch, horizon, 1)
-                outputs = self.model(
-                    inputs, 
-                    parametric_forecast=parametric_forecasts,
-                    future_observations=future_obs
-                )
                 
-                # Get posterior probabilities (batch, horizon, n_states)
-                posterior_probs = outputs['state_probs']
+                # Use autocast for mixed precision training
+                with autocast(enabled=self.use_amp):
+                    outputs = self.model(
+                        inputs, 
+                        parametric_forecast=parametric_forecasts,
+                        future_observations=future_obs
+                    )
+                    
+                    # Get posterior probabilities (batch, horizon, n_states)
+                    posterior_probs = outputs['state_probs']
+                    
+                    # Get emission mu and sigma for loss computation
+                    emission_mu = outputs['emission_mu']  # (n_states, batch, horizon)
+                    emission_sigma = outputs['emission_sigma']  # (n_states, batch, horizon)
+                    
+                    # Compute loss with log-likelihood
+                    loss_dict = self.loss_fn(
+                        emission_mu,
+                        emission_sigma,
+                        targets,
+                        posterior_probs=posterior_probs,
+                        stage='stage1'
+                    )
+                    
+                    loss = loss_dict['total_loss']
                 
-                # Get emission mu and sigma for loss computation
-                emission_mu = outputs['emission_mu']  # (n_states, batch, horizon)
-                emission_sigma = outputs['emission_sigma']  # (n_states, batch, horizon)
-                
-                # Compute loss with log-likelihood
-                loss_dict = self.loss_fn(
-                    emission_mu,
-                    emission_sigma,
-                    targets,
-                    posterior_probs=posterior_probs,
-                    stage='stage1'
-                )
-                
-                loss = loss_dict['total_loss']
-                
-                # Backward pass
+                # Backward pass with mixed precision
                 self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
                 
                 train_losses.append(loss.item())
             
@@ -288,6 +335,10 @@ class DELPHITrainer:
                     val_loss = val_result
                     self.history['stage1']['val_loss'].append(val_loss)
                     print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {val_loss:.4f}")
+                
+                # Step learning rate scheduler
+                if self.scheduler is not None:
+                    self.scheduler.step(val_loss)
                 
                 # Early stopping check
                 if val_loss < (self.best_val_loss_stage1 - self.early_stopping_min_delta):
@@ -350,7 +401,20 @@ class DELPHITrainer:
         prior_params = [
             p for p in self.model.parameters() if p.requires_grad
         ]
-        prior_optimizer = optim.Adam(prior_params, lr=1e-4)
+        prior_optimizer = optim.AdamW(prior_params, lr=1e-4, weight_decay=self.weight_decay)
+        
+        # Create scheduler for prior optimizer if scheduler is enabled
+        if self.use_scheduler:
+            prior_scheduler = lr_scheduler.ReduceLROnPlateau(
+                prior_optimizer,
+                mode='min',
+                factor=self.scheduler_factor,
+                patience=self.scheduler_patience,
+                min_lr=self.scheduler_min_lr,
+                verbose=True
+            )
+        else:
+            prior_scheduler = None
         
         self.model.train()
         
@@ -386,59 +450,67 @@ class DELPHITrainer:
                         mode='posterior'
                     )  # (batch, horizon, n_states)
                 
-                # Get prior probabilities (trainable)
-                # First compute emission predictions for prior
-                all_mus = []
-                all_sigmas = []
-                for corrector in self.model.ensemble.correctors:
-                    mu, sigma = corrector(inputs)
-                    all_mus.append(mu)
-                    all_sigmas.append(sigma)
-                emission_mu = torch.stack(all_mus, dim=0)  # (n_states, batch, horizon)
-                emission_sigma = torch.stack(all_sigmas, dim=0)  # (n_states, batch, horizon)
-                emission_mu_for_prior = emission_mu.permute(1, 2, 0)  # (batch, horizon, n_states)
+                # Get prior probabilities (trainable) with mixed precision
+                with autocast(enabled=self.use_amp):
+                    # First compute emission predictions for prior
+                    all_mus = []
+                    all_sigmas = []
+                    for corrector in self.model.ensemble.correctors:
+                        mu, sigma = corrector(inputs)
+                        all_mus.append(mu)
+                        all_sigmas.append(sigma)
+                    emission_mu = torch.stack(all_mus, dim=0)  # (n_states, batch, horizon)
+                    emission_sigma = torch.stack(all_sigmas, dim=0)  # (n_states, batch, horizon)
+                    emission_mu_for_prior = emission_mu.permute(1, 2, 0)  # (batch, horizon, n_states)
+                    
+                    # Get prior components
+                    init_probs, trans_matrices = self.model.hmm_gating.get_prior_components(
+                        x_past=inputs,
+                        x_future=emission_mu_for_prior
+                    )
+                    
+                    # Compute per-timestep prior probabilities
+                    # Build as list to avoid in-place operations that break autograd
+                    batch_size = inputs.shape[0]
+                    prior_probs_list = [init_probs]
+                    for t in range(1, self.model.output_dim):
+                        prev_probs = prior_probs_list[-1].unsqueeze(1)  # (batch, 1, n_states)
+                        trans_matrix = trans_matrices[:, t-1, :, :]  # (batch, n_states, n_states)
+                        next_probs = torch.bmm(prev_probs, trans_matrix).squeeze(1)  # (batch, n_states)
+                        prior_probs_list.append(next_probs)
+                    prior_probs = torch.stack(prior_probs_list, dim=1)  # (batch, horizon, n_states)
+                    
+                    # Compute log probabilities for KL divergence (per-timestep)
+                    posterior_logp = torch.log(posterior_probs + 1e-8)  # (batch, horizon, n_states)
+                    prior_logp = torch.log(prior_probs + 1e-8)  # (batch, horizon, n_states)
+                    
+                    # Compute loss (just the KL term for Stage 2)
+                    # Pass full tensors (not .mean()) - loss function will handle averaging
+                    loss_dict = self.loss_fn(
+                        emission_mu,
+                        emission_sigma,
+                        targets,
+                        prior_logp=prior_logp,
+                        posterior_logp=posterior_logp,
+                        posterior_probs=posterior_probs,
+                        stage='stage2'
+                    )
+                    
+                    # Use the loss from loss function (should be KL term)
+                    loss = loss_dict['total_loss']
                 
-                # Get prior components
-                init_probs, trans_matrices = self.model.hmm_gating.get_prior_components(
-                    x_past=inputs,
-                    x_future=emission_mu_for_prior
-                )
-                
-                # Compute per-timestep prior probabilities
-                # Build as list to avoid in-place operations that break autograd
-                batch_size = inputs.shape[0]
-                prior_probs_list = [init_probs]
-                for t in range(1, self.model.output_dim):
-                    prev_probs = prior_probs_list[-1].unsqueeze(1)  # (batch, 1, n_states)
-                    trans_matrix = trans_matrices[:, t-1, :, :]  # (batch, n_states, n_states)
-                    next_probs = torch.bmm(prev_probs, trans_matrix).squeeze(1)  # (batch, n_states)
-                    prior_probs_list.append(next_probs)
-                prior_probs = torch.stack(prior_probs_list, dim=1)  # (batch, horizon, n_states)
-                
-                # Compute log probabilities for KL divergence (per-timestep)
-                posterior_logp = torch.log(posterior_probs + 1e-8)  # (batch, horizon, n_states)
-                prior_logp = torch.log(prior_probs + 1e-8)  # (batch, horizon, n_states)
-                
-                # Compute loss (just the KL term for Stage 2)
-                # Pass full tensors (not .mean()) - loss function will handle averaging
-                loss_dict = self.loss_fn(
-                    emission_mu,
-                    emission_sigma,
-                    targets,
-                    prior_logp=prior_logp,
-                    posterior_logp=posterior_logp,
-                    posterior_probs=posterior_probs,
-                    stage='stage2'
-                )
-                
-                # Use the loss from loss function (should be KL term)
-                loss = loss_dict['total_loss']
-                
-                # Backward pass
+                # Backward pass with mixed precision
                 prior_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(prior_params, max_norm=1.0)
-                prior_optimizer.step()
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(prior_optimizer)
+                    torch.nn.utils.clip_grad_norm_(prior_params, max_norm=1.0)
+                    self.scaler.step(prior_optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(prior_params, max_norm=1.0)
+                    prior_optimizer.step()
                 
                 train_losses.append(loss.item())
             
@@ -467,6 +539,10 @@ class DELPHITrainer:
                     val_loss = val_result
                     self.history['stage2']['val_loss'].append(val_loss)
                     print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {val_loss:.4f}")
+                
+                # Step learning rate scheduler for prior optimizer
+                if prior_scheduler is not None:
+                    prior_scheduler.step(val_loss)
                 
                 # Early stopping check
                 if val_loss < (self.best_val_loss_stage2 - self.early_stopping_min_delta):
@@ -525,84 +601,86 @@ class DELPHITrainer:
                 if parametric_forecasts is not None:
                     parametric_forecasts = parametric_forecasts.to(self.device)
                 
-                if stage == 'stage2':
-                    # For Stage 2 validation, we need emissions computed separately for both prior and posterior
-                    # Get emission mu and sigma first (needed for both prior and posterior)
-                    all_mus = []
-                    all_sigmas = []
-                    for corrector in self.model.ensemble.correctors:
-                        mu, sigma = corrector(inputs)
-                        all_mus.append(mu)
-                        all_sigmas.append(sigma)
-                    emission_mu = torch.stack(all_mus, dim=0)  # (n_states, batch, horizon)
-                    emission_sigma = torch.stack(all_sigmas, dim=0)  # (n_states, batch, horizon)
-                    # For Stage 2 validation, we need both prior and posterior to compute KL divergence
-                    # Even though we're validating, we can use targets (future observations) to compute
-                    # the posterior, since we're just evaluating, not training
-                    
-                    # Compute prior probabilities
-                    emission_mu_for_prior = emission_mu.permute(1, 2, 0)  # (batch, horizon, n_states)
-                    init_probs, trans_matrices = self.model.hmm_gating.get_prior_components(
-                        x_past=inputs,
-                        x_future=emission_mu_for_prior
-                    )
-                    
-                    # Build prior probabilities (same as in training)
-                    batch_size = inputs.shape[0]
-                    prior_probs_list = [init_probs]
-                    for t in range(1, self.model.output_dim):
-                        prev_probs = prior_probs_list[-1].unsqueeze(1)  # (batch, 1, n_states)
-                        trans_matrix = trans_matrices[:, t-1, :, :]  # (batch, n_states, n_states)
-                        next_probs = torch.bmm(prev_probs, trans_matrix).squeeze(1)  # (batch, n_states)
-                        prior_probs_list.append(next_probs)
-                    prior_probs = torch.stack(prior_probs_list, dim=1)  # (batch, horizon, n_states)
-                    
-                    # Compute posterior probabilities using future observations (targets)
-                    future_obs = targets.unsqueeze(-1)  # (batch, horizon, 1)
-                    posterior_probs = self.model.hmm_gating(
-                        x_past=inputs,
-                        x_future=future_obs,
-                        mode='posterior'
-                    )  # (batch, horizon, n_states)
-                    
-                    # Compute log probabilities
-                    prior_logp = torch.log(prior_probs + 1e-8)  # (batch, horizon, n_states)
-                    posterior_logp = torch.log(posterior_probs + 1e-8)  # (batch, horizon, n_states)
-                    
-                    # Get model outputs for metrics
-                    outputs = self.model(inputs, parametric_forecast=parametric_forecasts)
-                    
-                    # Compute loss with prior and posterior log probabilities
-                    loss_dict = self.loss_fn(
-                        emission_mu,
-                        emission_sigma,
-                        targets,
-                        prior_logp=prior_logp,
-                        posterior_logp=posterior_logp,
-                        posterior_probs=posterior_probs,
-                        stage=stage
-                    )
-                else:
-                    # Stage 1 validation: use posterior with future observations (same as training)
-                    # This ensures proper ELBO loss computation during Stage 1 validation
-                    future_obs = targets.unsqueeze(-1)  # (batch, horizon, 1)
-                    outputs = self.model(
-                        inputs, 
-                        parametric_forecast=parametric_forecasts,
-                        future_observations=future_obs
-                    )
-                    # Use emissions from model forward pass (avoids redundant computation)
-                    emission_mu = outputs['emission_mu']  # (n_states, batch, horizon)
-                    emission_sigma = outputs['emission_sigma']  # (n_states, batch, horizon)
-                    posterior_probs = outputs['state_probs']  # (batch, horizon, n_states)
-                    
-                    loss_dict = self.loss_fn(
-                        emission_mu,
-                        emission_sigma,
-                        targets,
-                        posterior_probs=posterior_probs,
-                        stage=stage
-                    )
+                # Use autocast for mixed precision in validation
+                with autocast(enabled=self.use_amp):
+                    if stage == 'stage2':
+                        # For Stage 2 validation, we need emissions computed separately for both prior and posterior
+                        # Get emission mu and sigma first (needed for both prior and posterior)
+                        all_mus = []
+                        all_sigmas = []
+                        for corrector in self.model.ensemble.correctors:
+                            mu, sigma = corrector(inputs)
+                            all_mus.append(mu)
+                            all_sigmas.append(sigma)
+                        emission_mu = torch.stack(all_mus, dim=0)  # (n_states, batch, horizon)
+                        emission_sigma = torch.stack(all_sigmas, dim=0)  # (n_states, batch, horizon)
+                        # For Stage 2 validation, we need both prior and posterior to compute KL divergence
+                        # Even though we're validating, we can use targets (future observations) to compute
+                        # the posterior, since we're just evaluating, not training
+                        
+                        # Compute prior probabilities
+                        emission_mu_for_prior = emission_mu.permute(1, 2, 0)  # (batch, horizon, n_states)
+                        init_probs, trans_matrices = self.model.hmm_gating.get_prior_components(
+                            x_past=inputs,
+                            x_future=emission_mu_for_prior
+                        )
+                        
+                        # Build prior probabilities (same as in training)
+                        batch_size = inputs.shape[0]
+                        prior_probs_list = [init_probs]
+                        for t in range(1, self.model.output_dim):
+                            prev_probs = prior_probs_list[-1].unsqueeze(1)  # (batch, 1, n_states)
+                            trans_matrix = trans_matrices[:, t-1, :, :]  # (batch, n_states, n_states)
+                            next_probs = torch.bmm(prev_probs, trans_matrix).squeeze(1)  # (batch, n_states)
+                            prior_probs_list.append(next_probs)
+                        prior_probs = torch.stack(prior_probs_list, dim=1)  # (batch, horizon, n_states)
+                        
+                        # Compute posterior probabilities using future observations (targets)
+                        future_obs = targets.unsqueeze(-1)  # (batch, horizon, 1)
+                        posterior_probs = self.model.hmm_gating(
+                            x_past=inputs,
+                            x_future=future_obs,
+                            mode='posterior'
+                        )  # (batch, horizon, n_states)
+                        
+                        # Compute log probabilities
+                        prior_logp = torch.log(prior_probs + 1e-8)  # (batch, horizon, n_states)
+                        posterior_logp = torch.log(posterior_probs + 1e-8)  # (batch, horizon, n_states)
+                        
+                        # Get model outputs for metrics
+                        outputs = self.model(inputs, parametric_forecast=parametric_forecasts)
+                        
+                        # Compute loss with prior and posterior log probabilities
+                        loss_dict = self.loss_fn(
+                            emission_mu,
+                            emission_sigma,
+                            targets,
+                            prior_logp=prior_logp,
+                            posterior_logp=posterior_logp,
+                            posterior_probs=posterior_probs,
+                            stage=stage
+                        )
+                    else:
+                        # Stage 1 validation: use posterior with future observations (same as training)
+                        # This ensures proper ELBO loss computation during Stage 1 validation
+                        future_obs = targets.unsqueeze(-1)  # (batch, horizon, 1)
+                        outputs = self.model(
+                            inputs, 
+                            parametric_forecast=parametric_forecasts,
+                            future_observations=future_obs
+                        )
+                        # Use emissions from model forward pass (avoids redundant computation)
+                        emission_mu = outputs['emission_mu']  # (n_states, batch, horizon)
+                        emission_sigma = outputs['emission_sigma']  # (n_states, batch, horizon)
+                        posterior_probs = outputs['state_probs']  # (batch, horizon, n_states)
+                        
+                        loss_dict = self.loss_fn(
+                            emission_mu,
+                            emission_sigma,
+                            targets,
+                            posterior_probs=posterior_probs,
+                            stage=stage
+                        )
                 
                 val_losses.append(loss_dict['total_loss'].item())
                 
@@ -649,6 +727,14 @@ class DELPHITrainer:
             'history': self.history
         }
         
+        # Save scheduler state if available
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        
+        # Save scaler state if AMP is enabled
+        if self.scaler is not None:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+        
         torch.save(checkpoint, filepath)
         
         # Note: Best model checkpoints are saved explicitly in train_stage1/train_stage2
@@ -661,6 +747,14 @@ class DELPHITrainer:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.history = checkpoint.get('history', self.history)
+        
+        # Load scheduler state if available
+        if self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Load scaler state if available
+        if self.scaler is not None and 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
         # Restore best epoch info if available
         if 'history' in checkpoint and 'stage1' in checkpoint['history']:
