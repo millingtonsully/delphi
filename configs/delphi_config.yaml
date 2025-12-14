@@ -25,6 +25,8 @@ parametric:
   use_trend: true
   use_arma_errors: true
   seasonal_periods: [52]
+  n_parallel_workers: 7  # Use 6 workers for TBATS (leaves room for system)
+  n_jobs: 2  # Internal TBATS threading per fit
 
 # Variational HMM Gating
 hmm:
@@ -77,8 +79,9 @@ inference:
 
 # Hardware
 device: "cuda"
-num_workers: 4
+num_workers: 8  # Can use all cores during NN training (after TBATS)
 pin_memory: true
+persistent_workers: true  # Faster epoch transitions
 
 # Random seed
 seed: 42

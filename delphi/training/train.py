@@ -8,12 +8,18 @@ Implements training methodology:
 - Two-stage ELBO training for variational HMM
 """
 
+import os
+# Set environment variables for optimal threading before importing NumPy/SciPy
+# This allows TBATS to use multiple threads per fit while running parallel fits
+os.environ.setdefault('OMP_NUM_THREADS', '2')  # OpenMP threading for NumPy/SciPy
+os.environ.setdefault('MKL_NUM_THREADS', '2')  # Intel MKL threading
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '2')  # NumExpr threading
+
 import argparse
 import yaml
 import torch
 import numpy as np
 from pathlib import Path
-import os
 import sys
 from typing import Optional, Dict, Any, Union
 
@@ -235,12 +241,17 @@ def prepare_datasets(splits, config):
     num_train_series = len(splits['train']['main_signal'])
     print(f"Fitting TBATS models for {num_train_series} series (this may take a while)...")
     
+    # Get TBATS parallelization settings from config (with defaults for backwards compatibility)
+    n_parallel_workers = config['parametric'].get('n_parallel_workers', 8)
+    n_jobs = config['parametric'].get('n_jobs', 1)
+    
     tbats = TBATSBaseline(
         use_box_cox=config['parametric']['use_box_cox'],
         use_trend=config['parametric']['use_trend'],
         use_arma_errors=config['parametric']['use_arma_errors'],
         seasonal_periods=config['parametric']['seasonal_periods'],
-        n_parallel_workers=8
+        n_jobs=n_jobs,
+        n_parallel_workers=n_parallel_workers
     )
     
     train_forecasts, train_residuals = tbats.fit_and_forecast(
@@ -347,11 +358,19 @@ def prepare_datasets(splits, config):
     
     # Create datasets
     train_dataset = TimeSeriesDataset(train_inputs_final, train_targets_final, train_param_forecasts_final)
+    
+    # Get DataLoader settings from config (with defaults for backwards compatibility)
+    num_workers = config.get('num_workers', 0)
+    pin_memory = config.get('pin_memory', False)
+    persistent_workers = config.get('persistent_workers', False) and num_workers > 0
+    
     train_loader = TorchDataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=config.get('num_workers', 0)
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers
     )
     
     # Validation dataset is created from split above
@@ -361,7 +380,9 @@ def prepare_datasets(splits, config):
         val_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=config.get('num_workers', 0)
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers
     )
     
     return train_loader, val_loader

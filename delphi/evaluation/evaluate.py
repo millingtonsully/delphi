@@ -266,12 +266,17 @@ def main():
     
     # Generate parametric baseline forecasts
     print("\nGenerating TBATS baseline forecasts...")
+    # Get TBATS parallelization settings from config (with defaults for backwards compatibility)
+    n_parallel_workers = config['parametric'].get('n_parallel_workers', 8)
+    n_jobs = config['parametric'].get('n_jobs', 1)
+    
     tbats = TBATSBaseline(
         use_box_cox=config['parametric'].get('use_box_cox', True),
         use_trend=config['parametric'].get('use_trend', True),
         use_arma_errors=config['parametric'].get('use_arma_errors', True),
         seasonal_periods=config['parametric'].get('seasonal_periods', [52]),
-        n_parallel_workers=8
+        n_jobs=n_jobs,
+        n_parallel_workers=n_parallel_workers
     )
     
     # Use history up to the beginning of the test window for TBATS fitting
@@ -294,7 +299,7 @@ def main():
     print(f"  Successful fits: {tbats_stats['successful_fits']}/{len(eval_series)}")
     print(f"  Failed fits: {tbats_stats['failed_fits']}")
     print(f"  Fallback to mean: {tbats_stats['fallback_to_mean']}")
-    print(f"  Scaling applied: {tbats_stats['scaling_applied']}")
+    print(f"  Offset applied: {tbats_stats['offset_applied']}")
     
     # Check a sample of TBATS forecasts to verify scale
     sample_series_ids = list(eval_series[:3])

@@ -25,7 +25,7 @@ def _fit_single_series(args):
     Returns:
         Tuple of (series_id, result_dict) where result_dict contains:
             - 'model': fitted TBATS model or None if failed
-            - 'scale_factor': scaling factor applied
+            - 'offset': offset applied to make values positive (0.0 if none needed)
             - 'success': bool indicating success
             - 'error': error message if failed
     """
@@ -35,30 +35,33 @@ def _fit_single_series(args):
     if len(ts) < min_seasonal_length:
         return (series_id, {
             'model': None,
-            'scale_factor': 1.0,
+            'offset': 0.0,
             'success': False,
             'error': f'Series too short (length {len(ts)} < {min_seasonal_length})'
         })
     
     try:
-        # Handle Box-Cox transformation for small values
-        scale_factor = 1.0
+        # Handle Box-Cox transformation: use consistent offset-based approach
+        # Add offset to make all values strictly positive (statistically sound approach)
+        offset = 0.0
         ts_positive = ts.copy()
         
         if use_box_cox:
             min_val = np.min(ts)
-            if min_val < 0.01:
-                if min_val <= 0:
-                    offset = abs(min_val) + 0.001
-                    ts_positive = ts + offset
-                    min_val = np.min(ts_positive)
-                
-                if min_val < 0.01:
-                    scale_factor = 0.01 / min_val
-                    ts_positive = ts_positive * scale_factor
+            if min_val <= 0:
+                # Add offset to make all values positive
+                offset = abs(min_val) + 0.001
+                ts_positive = ts + offset
             else:
-                ts_positive = np.maximum(ts, 1e-6)
+                # Ensure minimum is not too close to zero for numerical stability
+                if min_val < 0.01:
+                    offset = 0.01 - min_val
+                    ts_positive = ts + offset
+                else:
+                    # Values are already positive and sufficiently large
+                    ts_positive = np.maximum(ts, 1e-6)
         else:
+            # Even without Box-Cox, ensure positive values for numerical stability
             ts_positive = np.maximum(ts, 1e-6)
         
         # Fit TBATS model
@@ -74,7 +77,7 @@ def _fit_single_series(args):
         
         return (series_id, {
             'model': fitted_model,
-            'scale_factor': scale_factor,
+            'offset': offset,
             'success': True,
             'error': None
         })
@@ -82,7 +85,7 @@ def _fit_single_series(args):
     except Exception as e:
         return (series_id, {
             'model': None,
-            'scale_factor': 1.0,
+            'offset': 0.0,
             'success': False,
             'error': str(e)
         })
@@ -126,14 +129,14 @@ class TBATSBaseline:
         self.fitted_models: Dict[str, any] = {}
         self.forecasts: Dict[str, np.ndarray] = {}
         self.residuals: Dict[str, np.ndarray] = {}
-        # Track scaling factors for each series (to reverse Box-Cox scaling)
-        self.scaling_factors: Dict[str, float] = {}
+        # Track offsets for each series (to reverse Box-Cox offset)
+        self.offset_factors: Dict[str, float] = {}
         # Diagnostics: track fitting success
         self.fitting_stats = {
             'successful_fits': 0,
             'failed_fits': 0,
             'fallback_to_mean': 0,
-            'scaling_applied': 0
+            'offset_applied': 0
         }
     
     def fit(
@@ -154,12 +157,12 @@ class TBATSBaseline:
             Dictionary of fitted models
         """
         self.fitted_models = {}
-        self.scaling_factors = {}
+        self.offset_factors = {}
         self.fitting_stats = {
             'successful_fits': 0,
             'failed_fits': 0,
             'fallback_to_mean': 0,
-            'scaling_applied': 0
+            'offset_applied': 0
         }
         
         total_series = len(time_series)
@@ -170,16 +173,23 @@ class TBATSBaseline:
         min_seasonal_length = max(self.seasonal_periods) * 2
         
         # Prepare arguments for multiprocessing
+        # When using multiprocessing, disable internal TBATS parallelism (n_jobs=1)
+        # to avoid "daemonic processes" error on Windows
+        # Internal parallelism is only used when running sequentially
+        use_multiprocessing = self.n_parallel_workers > 1 and total_series > 1
+        effective_n_jobs = 1 if use_multiprocessing else self.n_jobs
+        
         fit_args = [
             (series_id, ts, self.use_box_cox, self.use_trend, self.use_arma_errors,
-             self.seasonal_periods, self.n_jobs, min_seasonal_length)
+             self.seasonal_periods, effective_n_jobs, min_seasonal_length)
             for series_id, ts in time_series.items()
         ]
         
         # Use multiprocessing if we have multiple workers and series
-        if self.n_parallel_workers > 1 and total_series > 1:
+        if use_multiprocessing:
             if verbose:
-                print(f"Fitting TBATS models for {total_series} series using {self.n_parallel_workers} parallel workers...")
+                print(f"Fitting TBATS models for {total_series} series using {self.n_parallel_workers} parallel workers "
+                      f"(internal threading disabled to avoid nested multiprocessing issues)...")
             
             # Process with multiprocessing using imap_unordered for better progress tracking
             with multiprocessing.Pool(processes=self.n_parallel_workers) as pool:
@@ -206,21 +216,22 @@ class TBATSBaseline:
                 for series_id, result_dict in results_dict.items():
                     if result_dict['success']:
                         self.fitted_models[series_id] = result_dict['model']
-                        self.scaling_factors[series_id] = result_dict['scale_factor']
+                        self.offset_factors[series_id] = result_dict['offset']
                         self.fitting_stats['successful_fits'] += 1
-                        if result_dict['scale_factor'] != 1.0:
-                            self.fitting_stats['scaling_applied'] += 1
+                        if result_dict['offset'] != 0.0:
+                            self.fitting_stats['offset_applied'] += 1
                     else:
                         if verbose and result_dict['error'] and 'too short' not in result_dict['error'].lower():
                             print(f"Warning: Series {series_id} failed: {result_dict['error']}")
                         self.fitted_models[series_id] = None
-                        self.scaling_factors[series_id] = 1.0
+                        self.offset_factors[series_id] = 0.0
                         self.fitting_stats['failed_fits'] += 1
         else:
             # Sequential processing (fallback or single worker)
             if verbose:
                 print(f"Fitting TBATS models for {total_series} series sequentially...")
             
+            # Sequential mode: can use internal parallelism (n_jobs from config)
             for idx, (series_id, ts) in enumerate(time_series.items(), 1):
                 args = (series_id, ts, self.use_box_cox, self.use_trend, self.use_arma_errors,
                         self.seasonal_periods, self.n_jobs, min_seasonal_length)
@@ -228,15 +239,15 @@ class TBATSBaseline:
                 
                 if result_dict['success']:
                     self.fitted_models[series_id_result] = result_dict['model']
-                    self.scaling_factors[series_id_result] = result_dict['scale_factor']
+                    self.offset_factors[series_id_result] = result_dict['offset']
                     self.fitting_stats['successful_fits'] += 1
-                    if result_dict['scale_factor'] != 1.0:
-                        self.fitting_stats['scaling_applied'] += 1
+                    if result_dict['offset'] != 0.0:
+                        self.fitting_stats['offset_applied'] += 1
                 else:
                     if verbose and result_dict['error']:
                         print(f"Warning: Series {series_id_result} failed: {result_dict['error']}")
                     self.fitted_models[series_id_result] = None
-                    self.scaling_factors[series_id_result] = 1.0
+                    self.offset_factors[series_id_result] = 0.0
                     self.fitting_stats['failed_fits'] += 1
                 
                 # Progress indicator every 100 series
@@ -254,8 +265,8 @@ class TBATSBaseline:
             successful = self.fitting_stats['successful_fits']
             print(f"\nTBATS fitting complete. Fitted {successful}/{total_series} models "
                   f"in {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
-            if self.fitting_stats['scaling_applied'] > 0:
-                print(f"  Applied scaling to {self.fitting_stats['scaling_applied']} series for Box-Cox")
+            if self.fitting_stats['offset_applied'] > 0:
+                print(f"  Applied offset to {self.fitting_stats['offset_applied']} series for Box-Cox")
             if self.fitting_stats['failed_fits'] > 0:
                 print(f"  Failed fits: {self.fitting_stats['failed_fits']}")
         
@@ -298,9 +309,9 @@ class TBATSBaseline:
                 forecasts[series_id] = np.full(forecast_horizon, mean_val)
                 if return_residuals:
                     residuals[series_id] = ts - mean_val
-                # Ensure scaling factor exists for consistency
-                if series_id not in self.scaling_factors:
-                    self.scaling_factors[series_id] = 1.0
+                # Ensure offset factor exists for consistency
+                if series_id not in self.offset_factors:
+                    self.offset_factors[series_id] = 0.0
                 self.fitting_stats['fallback_to_mean'] += 1
                 continue
             
@@ -309,10 +320,10 @@ class TBATSBaseline:
                 forecast_result = fitted_model.forecast(steps=forecast_horizon)
                 forecast_array = np.array(forecast_result)
                 
-                # Scale forecast back to original scale if scaling was applied
-                scale_factor = self.scaling_factors.get(series_id, 1.0)
-                if scale_factor != 1.0:
-                    forecast_array = forecast_array / scale_factor
+                # Reverse offset to return forecast to original scale
+                offset = self.offset_factors.get(series_id, 0.0)
+                if offset != 0.0:
+                    forecast_array = forecast_array - offset
                 
                 forecasts[series_id] = forecast_array
                 
@@ -328,9 +339,9 @@ class TBATSBaseline:
                         fitted_values = fitted_model.fitted
                     
                     if fitted_values is not None and len(fitted_values) == len(ts):
-                        # Scale fitted values back to original scale
-                        if scale_factor != 1.0:
-                            fitted_values = fitted_values / scale_factor
+                        # Reverse offset from fitted values to return to original scale
+                        if offset != 0.0:
+                            fitted_values = fitted_values - offset
                         residuals[series_id] = ts - fitted_values
                     else:
                         # Fallback: compute residuals using mean as approximation
