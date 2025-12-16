@@ -15,9 +15,7 @@ import warnings
 
 try:
     import shap
-    SHAP_AVAILABLE = True
 except ImportError:
-    SHAP_AVAILABLE = False
     raise ImportError(
         "SHAP library is required for feature attribution. "
         "Install with: pip install shap>=0.44.0"
@@ -190,6 +188,8 @@ class TimeSeriesFeatureAttribution:
         # Add small noise for diversity in background distribution
         # This helps GradientSHAP compute more robust expected gradients
         noise_scale = 0.01 * x.std()
+        # Ensure minimum noise scale for numerical stability
+        noise_scale = torch.clamp(noise_scale, min=1e-6)
         noise = torch.randn(n_samples, *mean_baseline.shape[1:], device=x.device) * noise_scale
         
         background = mean_baseline.expand(n_samples, -1, -1) + noise
