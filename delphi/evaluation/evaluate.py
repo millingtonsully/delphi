@@ -119,7 +119,15 @@ def predict_series(
         }
 
 
+# Guard against duplicate execution (Windows python -m issue)
+_main_executed = False
+
 def main():
+    global _main_executed
+    if _main_executed:
+        return
+    _main_executed = True
+    
     parser = argparse.ArgumentParser(description='Evaluate DELPHI model')
     parser.add_argument('--model_path', type=str, required=True,
                        help='Path to model checkpoint')
