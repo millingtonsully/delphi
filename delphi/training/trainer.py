@@ -70,10 +70,10 @@ class DELPHITrainer:
         entropy_weight: float = 0.01,
         stage1_epochs: int = 50,
         stage2_epochs: int = 30,
-        kl_anneal: bool = False,
+        kl_anneal: bool = True,
         kl_start: Optional[float] = None,
         kl_end: Optional[float] = None,
-        kl_warmup_epochs: int = 0,
+        kl_warmup_epochs: int = 1,  # Minimum 1 to prevent division by zero (enforced in __init__)
         early_stopping_patience: int = 10,
         early_stopping_min_delta: float = 1e-4,
         checkpoint_dir: Optional[str] = None,
@@ -91,10 +91,18 @@ class DELPHITrainer:
             device: Device for training
             learning_rate: Learning rate
             weight_decay: Weight decay
-            kl_weight: KL divergence weight
+            kl_weight: KL divergence weight (final value after annealing)
             entropy_weight: Entropy regularization weight
             stage1_epochs: Number of epochs for stage 1 (emissions/posterior)
             stage2_epochs: Number of epochs for stage 2 (prior)
+            kl_anneal: Always True - KL annealing is always enabled
+            kl_start: Starting KL weight for annealing (default: 0.0).
+                     Best practice: start from 0.0 to learn reconstruction first.
+            kl_end: Final KL weight for annealing (default: kl_weight).
+                   Target KL weight reached after warmup.
+            kl_warmup_epochs: Number of epochs to linearly anneal KL weight from 
+                            kl_start to kl_end. Minimum value: 1 (enforced to prevent division by zero).
+                            Typical values: 10-50% of stage1_epochs.
             early_stopping_patience: Number of epochs to wait before stopping if no improvement
             early_stopping_min_delta: Minimum change to qualify as an improvement
             checkpoint_dir: Directory to save checkpoints (for best model)
@@ -111,11 +119,14 @@ class DELPHITrainer:
         self.base_kl_weight = kl_weight
         self.weight_decay = weight_decay
 
-        # KL annealing configuration
+        # KL annealing configuration (always enabled)
         self.kl_anneal = kl_anneal
-        self.kl_start = kl_start if kl_start is not None else kl_weight
+        # Default kl_start to 0.0 (best practice: learn reconstruction first)
+        self.kl_start = kl_start if kl_start is not None else 0.0
+        # Default kl_end to target kl_weight
         self.kl_end = kl_end if kl_end is not None else kl_weight
-        self.kl_warmup_epochs = max(0, kl_warmup_epochs)
+        # Enforce minimum 1 epoch to prevent division by zero in annealing calculation
+        self.kl_warmup_epochs = max(1, kl_warmup_epochs)
         
         # Early stopping configuration
         self.early_stopping_patience = early_stopping_patience
@@ -236,13 +247,10 @@ class DELPHITrainer:
         for epoch in range(num_epochs):
             train_losses = []
 
-            # KL annealing: update KL weight for this epoch
-            if self.kl_anneal and self.kl_warmup_epochs > 0:
-                # epoch is zero-based; use epoch+1 for human-friendly schedule
-                factor = min(1.0, float(epoch + 1) / float(self.kl_warmup_epochs))
-                current_kl = self.kl_start + factor * (self.kl_end - self.kl_start)
-            else:
-                current_kl = self.kl_end
+            # KL annealing: update KL weight for this epoch (always enabled)
+            # epoch is zero-based; use epoch+1 for human-friendly schedule
+            factor = min(1.0, float(epoch + 1) / float(self.kl_warmup_epochs))
+            current_kl = self.kl_start + factor * (self.kl_end - self.kl_start)
             # Apply to underlying ELBO loss
             self.loss_fn.elbo_loss.kl_weight = current_kl
             

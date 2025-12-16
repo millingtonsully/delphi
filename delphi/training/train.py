@@ -119,12 +119,16 @@ def _validate_and_convert_config(config: Dict) -> Dict:
         config['training'].get('early_stopping_min_delta', 1e-4), default=1e-4, min_val=0.0
     )
 
-    # KL annealing configuration (optional)
+    # KL annealing configuration (always enabled)
     training_cfg = config['training']
-    training_cfg['kl_anneal'] = bool(training_cfg.get('kl_anneal', False))
+    training_cfg['kl_anneal'] = True  # Always enabled
+    
+    # Set default warmup epochs if not specified (use half of stage1_epochs or minimum 5)
+    default_warmup = max(5, training_cfg['stage1_epochs'] // 2)
+    
     training_cfg['kl_start'] = _ensure_numeric(
-        training_cfg.get('kl_start', training_cfg['kl_weight']),
-        default=training_cfg['kl_weight'],
+        training_cfg.get('kl_start', 0.0),  # Start from 0 for proper annealing
+        default=0.0,
         min_val=0.0
     )
     training_cfg['kl_end'] = _ensure_numeric(
@@ -133,9 +137,9 @@ def _validate_and_convert_config(config: Dict) -> Dict:
         min_val=0.0
     )
     training_cfg['kl_warmup_epochs'] = _ensure_numeric(
-        training_cfg.get('kl_warmup_epochs', 0),
-        default=0,
-        min_val=0,
+        training_cfg.get('kl_warmup_epochs', default_warmup),
+        default=default_warmup,
+        min_val=1,  # At least 1 epoch for annealing
         value_type='int'
     )
     
