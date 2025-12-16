@@ -122,6 +122,11 @@ def predict_series(
 # Guard against duplicate execution (Windows python -m issue)
 _main_executed = False
 
+def _filter_series_dict(series_dict: Dict[str, np.ndarray], allowed_ids: list) -> Dict[str, np.ndarray]:
+    """Return a dict containing only allowed series IDs."""
+    return {k: v for k, v in series_dict.items() if k in allowed_ids}
+
+
 def main():
     global _main_executed
     if _main_executed:
@@ -138,7 +143,9 @@ def main():
     parser.add_argument('--output_dir', type=str, default='evaluation_results',
                        help='Directory to save evaluation results')
     parser.add_argument('--num_series', type=int, default=10000,
-                       help='Number of series to evaluate (default: 10000 to match paper, can use 100 or 1000 for testing)')
+                       help='Number of series to evaluate (uses random subset with seed)')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='Random seed for series subsampling (defaults to config seed or 42)')
     args = parser.parse_args()
     
     # Resolve config path relative to project root
@@ -167,6 +174,10 @@ def main():
     if device == 'cuda' and not torch.cuda.is_available():
         device = 'cpu'
     
+    # Random seed for reproducible subsampling
+    seed = args.seed if args.seed is not None else _ensure_numeric(config.get('seed', 42), 42, 'int')
+    rng = np.random.default_rng(int(seed))
+
     model_config = {
         'input_dim': 3,
         'n_states': config['hmm']['n_states'],
@@ -191,7 +202,22 @@ def main():
     loader = DataLoader(data_dir=data_dir)
     data = loader.load_all_series(load_weak_signal=True)
     
-    # Preserve original data for MASE computation (before deseasonalization)
+    # Select subset of series before preprocessing to reduce runtime
+    all_series_ids = list(data['main_signal'].keys())
+    rng.shuffle(all_series_ids)
+    selected_ids = all_series_ids[:args.num_series]
+    if len(selected_ids) < len(all_series_ids):
+        print(f"Subsampling series: {len(selected_ids)} of {len(all_series_ids)} (seed={seed})")
+    else:
+        print(f"Using all available series: {len(selected_ids)} (seed={seed})")
+
+    # Filter data to the selected subset (main + weak signals)
+    data = {
+        'main_signal': _filter_series_dict(data['main_signal'], selected_ids),
+        'weak_signal': _filter_series_dict(data.get('weak_signal', {}), selected_ids)
+    }
+
+    # Preserve original data for MASE computation (before deseasonalization) on the subset
     # MASE is evaluated on original scale, not deseasonalized
     original_data = {
         'main_signal': {k: v.copy() for k, v in data['main_signal'].items()},
@@ -262,15 +288,14 @@ def main():
         print("\nERROR: No series have test data for the requested split.")
         return
     
-    # Limit number of series (default 10000 to match paper, but can use 100 or 1000 for testing)
-    # Limit number of series (default 10000 to match paper, but can use 100 or 1000 for testing)
-    # This allows flexible evaluation: --num_series 100, 1000, or 10000
-    eval_series = valid_series[:args.num_series]
-    print(f"\nEvaluating on {len(eval_series)} series...")
-    if len(valid_series) > args.num_series:
-        print(f"  (Limited from {len(valid_series)} available series)")
-    else:
-        print(f"  (All {len(valid_series)} available series evaluated)")
+    # Respect the preselected subset while ensuring test availability
+    eval_series = [sid for sid in selected_ids if sid in valid_series][:args.num_series]
+    dropped = len(selected_ids) - len(eval_series)
+    print(f"\nEvaluating on {len(eval_series)} series (seed={seed})...")
+    if dropped > 0:
+        print(f"  Skipped {dropped} selected series without test data.")
+    if len(valid_series) > len(eval_series):
+        print(f"  (Limited from {len(valid_series)} available valid series)")
     
     # Generate parametric baseline forecasts
     print("\nGenerating TBATS baseline forecasts...")

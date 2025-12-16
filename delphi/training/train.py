@@ -236,14 +236,50 @@ def prepare_data(config):
 
 
 def prepare_datasets(splits, config):
-    """Prepare PyTorch datasets."""
-    # Get parametric forecasts
-    num_train_series = len(splits['train']['main_signal'])
-    print(f"Fitting TBATS models for {num_train_series} series (this may take a while)...")
+    """
+    Prepare PyTorch datasets with residual-based training.
     
-    # Get TBATS parallelization settings from config (with defaults for backwards compatibility)
+    Methodology (matches hybrid forecasting best practices):
+    - Fit TBATS once per series on all available training data
+    - Use TBATS fitted values (in-sample predictions) as the baseline
+    - Training target = actual - TBATS_fitted_value (residual)
+    - Model learns to predict residuals
+    - At inference: forecast = TBATS_forecast + learned_residual
+    
+    This is much faster than per-window fitting while maintaining correct
+    residual-based training.
+    """
+    import time
+    
+    horizon = config['data']['forecast_horizon']
+    seq_len = 52  # Context length
+    
+    # Get TBATS parallelization settings
     n_parallel_workers = config['parametric'].get('n_parallel_workers', 8)
     n_jobs = config['parametric'].get('n_jobs', 1)
+    
+    # Use all available series by default (can be limited via config if needed)
+    series_limit = config.get('training_series_limit', None)
+    all_series = list(splits['train']['main_signal'].keys())
+    if series_limit is not None:
+        series_list = all_series[:series_limit]
+    else:
+        series_list = all_series
+    total_series = len(series_list)
+    
+    print(f"\n{'='*70}")
+    print("PREPARING TRAINING DATA WITH RESIDUAL-BASED TARGETS")
+    print(f"{'='*70}")
+    print(f"Series to process: {total_series}")
+    print(f"Sequence length: {seq_len}, Forecast horizon: {horizon}")
+    print(f"TBATS parallel workers: {n_parallel_workers}")
+    print(f"{'='*70}\n")
+    
+    # Step 1: Fit TBATS once per series and get fitted values
+    print("Step 1: Fitting TBATS models (one per series)...")
+    
+    # Prepare data for TBATS fitting - only for selected series
+    tbats_input = {sid: splits['train']['main_signal'][sid] for sid in series_list}
     
     tbats = TBATSBaseline(
         use_box_cox=config['parametric']['use_box_cox'],
@@ -254,92 +290,155 @@ def prepare_datasets(splits, config):
         n_parallel_workers=n_parallel_workers
     )
     
-    train_forecasts, train_residuals = tbats.fit_and_forecast(
-        splits['train']['main_signal'],
-        forecast_horizon=config['data']['forecast_horizon'],
+    # Fit and get forecasts + residuals (fitted values are computed internally)
+    tbats_forecasts, tbats_residuals = tbats.fit_and_forecast(
+        tbats_input,
+        forecast_horizon=horizon,
         verbose=True
     )
     
-    # Prepare inputs and targets
-    print("Creating training sequences...")
+    # Get fitting statistics
+    tbats_stats = tbats.get_fitting_stats()
+    print(f"\nTBATS Fitting Statistics:")
+    print(f"  Successful fits: {tbats_stats['successful_fits']}/{total_series}")
+    print(f"  Failed fits: {tbats_stats['failed_fits']}")
+    print(f"  Fallback to mean: {tbats_stats['fallback_to_mean']}")
+    
+    # Step 2: Create training sequences with residual targets
+    print("\nStep 2: Creating training sequences with residual targets...")
+    seq_start = time.time()
+    
     train_inputs = []
-    train_targets = []
+    train_targets = []  # These will be RESIDUALS
     train_param_forecasts = []
     
-    # Limit series for sequence creation (can be adjusted)
-    series_limit = 100  # Limit for now
-    series_list = list(splits['train']['main_signal'].keys())[:series_limit]
-    total_series = len(series_list)
+    sequences_created = 0
+    series_processed = 0
     
-    import time
-    seq_start_time = time.time()
-    
-    for series_idx, series_id in enumerate(series_list, 1):
+    for series_id in series_list:
         main_signal = splits['train']['main_signal'][series_id]
         weak_ratio = splits['train'].get('weak_signal_ratio', {}).get(series_id)
-        param_forecast = train_forecasts.get(series_id)
-        series_residuals = train_residuals.get(series_id)
+        series_residuals = tbats_residuals.get(series_id)  # In-sample residuals
+        series_forecast = tbats_forecasts.get(series_id)  # Out-of-sample forecast
         
-        if len(main_signal) < config['data']['forecast_horizon'] + 52:
+        if len(main_signal) < horizon + seq_len:
             continue
         
-        # Create sequences
-        seq_len = 52
-        for i in range(len(main_signal) - seq_len - config['data']['forecast_horizon']):
-            input_seq = main_signal[i:i+seq_len]
-            target_seq = main_signal[i+seq_len:i+seq_len+config['data']['forecast_horizon']]
+        if series_residuals is None or len(series_residuals) < seq_len + horizon:
+            continue
+        
+        series_processed += 1
+        n_windows = len(main_signal) - seq_len - horizon
+        
+        for i in range(n_windows):
+            # Input sequence
+            input_seq = main_signal[i:i + seq_len]
             
-            # Get residuals for this sequence window
-            residual_seq = None
-            if series_residuals is not None and len(series_residuals) >= i + seq_len:
-                residual_seq = series_residuals[i:i+seq_len]
+            # Actual future values
+            actual_future = main_signal[i + seq_len:i + seq_len + horizon]
             
-            # Prepare model input with residuals
-            weak_seq = weak_ratio[i:i+seq_len] if weak_ratio is not None else None
-            param_seq = param_forecast[:config['data']['forecast_horizon']] if param_forecast is not None else None
+            # Get residuals for the input window (for input features)
+            input_residuals = series_residuals[i:i + seq_len] if i + seq_len <= len(series_residuals) else None
             
+            # For training target, we need the forecast error for the future period
+            # Use the residuals from the future period if available (in-sample)
+            # Otherwise, use the difference from a baseline
+            future_start = i + seq_len
+            future_end = future_start + horizon
+            
+            if future_end <= len(series_residuals):
+                # In-sample: use actual residuals
+                residual_target = series_residuals[future_start:future_end]
+                # The "TBATS forecast" for this window is actual - residual
+                tbats_baseline = actual_future - residual_target
+            else:
+                # Near the end: use the final forecast as baseline
+                # Compute how much of the horizon is in-sample vs out-of-sample
+                in_sample_len = max(0, len(series_residuals) - future_start)
+                
+                if in_sample_len > 0 and series_forecast is not None:
+                    # Part in-sample, part out-of-sample
+                    in_sample_residuals = series_residuals[future_start:len(series_residuals)]
+                    out_of_sample_len = horizon - in_sample_len
+                    
+                    # For out-of-sample portion, use the forecast
+                    out_of_sample_forecast = series_forecast[:out_of_sample_len]
+                    out_of_sample_actual = actual_future[in_sample_len:]
+                    out_of_sample_residuals = out_of_sample_actual - out_of_sample_forecast
+                    
+                    residual_target = np.concatenate([in_sample_residuals, out_of_sample_residuals])
+                    
+                    in_sample_baseline = actual_future[:in_sample_len] - in_sample_residuals
+                    tbats_baseline = np.concatenate([in_sample_baseline, out_of_sample_forecast])
+                elif series_forecast is not None:
+                    # Fully out-of-sample
+                    tbats_baseline = series_forecast[:horizon]
+                    residual_target = actual_future - tbats_baseline
+                else:
+                    # Fallback: use mean
+                    mean_val = np.mean(main_signal)
+                    tbats_baseline = np.full(horizon, mean_val)
+                    residual_target = actual_future - tbats_baseline
+            
+            # Weak signal for this window
+            weak_seq = None
+            if weak_ratio is not None and len(weak_ratio) >= i + seq_len:
+                weak_seq = weak_ratio[i:i + seq_len]
+            
+            # Handle missing input residuals
+            if input_residuals is None or len(input_residuals) != seq_len:
+                input_residuals = input_seq - np.mean(input_seq)
+            
+            # Prepare model input
             input_tensor = prepare_model_inputs(
                 input_seq,
-                residuals=residual_seq,
+                residuals=input_residuals,
                 weak_signal_ratio=weak_seq,
-                parametric_forecast=param_seq
+                parametric_forecast=tbats_baseline
             )
             
             train_inputs.append(input_tensor)
-            train_targets.append(target_seq)
-            if param_seq is not None:
-                train_param_forecasts.append(param_seq)
+            train_targets.append(residual_target)
+            train_param_forecasts.append(tbats_baseline)
+            sequences_created += 1
         
-        # Progress indicator every 10 series
-        if series_idx % 10 == 0 or series_idx == total_series:
-            elapsed = time.time() - seq_start_time
-            print(f"Creating sequences... {series_idx}/{total_series} series processed "
-                  f"({len(train_inputs)} sequences created, elapsed: {elapsed:.1f}s)")
+        # Progress indicator
+        if series_processed % 20 == 0 or series_processed == total_series:
+            print(f"  Processed {series_processed}/{total_series} series "
+                  f"({sequences_created} sequences created)")
     
-    print(f"Sequence creation complete. Created {len(train_inputs)} training sequences.")
+    print(f"\nCreated {sequences_created} training sequences in {time.time() - seq_start:.1f}s")
     
-    # Safety check: ensure we have sequences
+    # Safety check
     if len(train_inputs) == 0:
         raise ValueError("No training sequences created! Check data length and forecast_horizon settings.")
     
     # Convert to arrays
     train_inputs = np.array(train_inputs)
     train_targets = np.array(train_targets)
-    train_param_forecasts = np.array(train_param_forecasts) if train_param_forecasts else None
+    train_param_forecasts = np.array(train_param_forecasts)
     
-    print(f"Total sequences created: {len(train_inputs)}")
-    print(f"Dataset shapes - Inputs: {train_inputs.shape}, Targets: {train_targets.shape}")
-    if train_param_forecasts is not None:
-        print(f"Parametric forecasts shape: {train_param_forecasts.shape}")
+    print(f"\nDataset shapes:")
+    print(f"  Inputs: {train_inputs.shape}")
+    print(f"  Targets (residuals): {train_targets.shape}")
+    print(f"  Parametric forecasts: {train_param_forecasts.shape}")
+    
+    # Verify residuals are small relative to forecasts
+    target_mean = np.mean(np.abs(train_targets))
+    forecast_mean = np.mean(np.abs(train_param_forecasts))
+    ratio = target_mean / (forecast_mean + 1e-8)
+    print(f"\nResidual statistics:")
+    print(f"  Mean |residual|: {target_mean:.6f}")
+    print(f"  Mean |TBATS baseline|: {forecast_mean:.6f}")
+    print(f"  Ratio: {ratio:.4f} (should be < 1 for good TBATS fit)")
+    
+    if ratio > 1.0:
+        print(f"  WARNING: Residuals are larger than TBATS baseline. This may indicate poor TBATS fit.")
     
     # Split sequences into train/validation (80/20 split)
-    # Note: The validation period (weeks 210-261 = 52 weeks) is too short
-    # to create sequences (need seq_len + forecast_horizon = 78 weeks minimum).
-    # Following standard practice, we use temporal holdout from training sequences for validation.
-    # This ensures no data leakage while providing validation data for early stopping.
-    print("\nSplitting sequences into training and validation sets (80/20)...")
+    print("\nStep 3: Splitting into training and validation sets (80/20)...")
     n_total = len(train_inputs)
-    val_size = max(1, n_total // 5)  # 20% for validation
+    val_size = max(1, n_total // 5)
     
     # Use last portion for validation (temporal split)
     val_indices = np.arange(n_total - val_size, n_total)
@@ -348,18 +447,19 @@ def prepare_datasets(splits, config):
     # Split the data
     train_inputs_final = train_inputs[train_indices]
     train_targets_final = train_targets[train_indices]
-    train_param_forecasts_final = train_param_forecasts[train_indices] if train_param_forecasts is not None else None
+    train_param_forecasts_final = train_param_forecasts[train_indices]
     
     val_inputs_array = train_inputs[val_indices]
     val_targets_array = train_targets[val_indices]
-    val_param_forecasts_array = train_param_forecasts[val_indices] if train_param_forecasts is not None else None
+    val_param_forecasts_array = train_param_forecasts[val_indices]
     
-    print(f"Training sequences: {len(train_inputs_final)}, Validation sequences: {len(val_inputs_array)}")
+    print(f"  Training sequences: {len(train_inputs_final)}")
+    print(f"  Validation sequences: {len(val_inputs_array)}")
     
     # Create datasets
     train_dataset = TimeSeriesDataset(train_inputs_final, train_targets_final, train_param_forecasts_final)
     
-    # Get DataLoader settings from config (with defaults for backwards compatibility)
+    # Get DataLoader settings
     num_workers = config.get('num_workers', 0)
     pin_memory = config.get('pin_memory', False)
     persistent_workers = config.get('persistent_workers', False) and num_workers > 0
@@ -373,7 +473,6 @@ def prepare_datasets(splits, config):
         persistent_workers=persistent_workers
     )
     
-    # Validation dataset is created from split above
     val_dataset = TimeSeriesDataset(val_inputs_array, val_targets_array, val_param_forecasts_array)
     
     val_loader = TorchDataLoader(
@@ -384,6 +483,10 @@ def prepare_datasets(splits, config):
         pin_memory=pin_memory,
         persistent_workers=persistent_workers
     )
+    
+    print(f"\n{'='*70}")
+    print("TRAINING DATA PREPARATION COMPLETE")
+    print(f"{'='*70}\n")
     
     return train_loader, val_loader
 
