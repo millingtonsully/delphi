@@ -85,3 +85,7 @@ persistent_workers: false  # Changed from true - requires num_workers > 0
 
 # Random seed
 seed: 42
+
+# Training series limit (for faster TBATS fitting)
+# Remove or set to null to use all available series (~1.3M)
+training_series_limit: 50000
