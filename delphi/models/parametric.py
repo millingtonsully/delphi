@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple, List
 import warnings
 import time
 import os
+import pickle
 import multiprocessing
 from tbats import TBATS
 
@@ -413,6 +414,84 @@ class TBATSBaseline:
     def get_fitting_stats(self) -> Dict[str, int]:
         """Get statistics about TBATS fitting."""
         return self.fitting_stats.copy()
+    
+    def save_checkpoint(self, filepath: str) -> None:
+        """
+        Save TBATS checkpoint to disk for resuming training.
+        
+        Args:
+            filepath: Path to save the checkpoint file
+        """
+        checkpoint = {
+            'fitted_models': self.fitted_models,
+            'forecasts': self.forecasts,
+            'residuals': self.residuals,
+            'offset_factors': self.offset_factors,
+            'fitting_stats': self.fitting_stats,
+            # Save config for validation on load
+            'config': {
+                'use_box_cox': self.use_box_cox,
+                'use_trend': self.use_trend,
+                'use_arma_errors': self.use_arma_errors,
+                'seasonal_periods': self.seasonal_periods,
+                'n_jobs': self.n_jobs,
+                'n_parallel_workers': self.n_parallel_workers
+            }
+        }
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(checkpoint, f)
+        
+        print(f"TBATS checkpoint saved to {filepath}")
+        print(f"  Models: {len(self.fitted_models)}, Forecasts: {len(self.forecasts)}")
+    
+    @classmethod
+    def load_checkpoint(cls, filepath: str) -> 'TBATSBaseline':
+        """
+        Load TBATS checkpoint from disk.
+        
+        Args:
+            filepath: Path to the checkpoint file
+            
+        Returns:
+            TBATSBaseline instance with restored state
+        """
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"TBATS checkpoint not found: {filepath}")
+        
+        with open(filepath, 'rb') as f:
+            checkpoint = pickle.load(f)
+        
+        # Create instance with saved config
+        config = checkpoint.get('config', {})
+        instance = cls(
+            use_box_cox=config.get('use_box_cox', True),
+            use_trend=config.get('use_trend', True),
+            use_arma_errors=config.get('use_arma_errors', True),
+            seasonal_periods=config.get('seasonal_periods', [52]),
+            n_jobs=config.get('n_jobs', 1),
+            n_parallel_workers=config.get('n_parallel_workers', 8)
+        )
+        
+        # Restore state
+        instance.fitted_models = checkpoint.get('fitted_models', {})
+        instance.forecasts = checkpoint.get('forecasts', {})
+        instance.residuals = checkpoint.get('residuals', {})
+        instance.offset_factors = checkpoint.get('offset_factors', {})
+        instance.fitting_stats = checkpoint.get('fitting_stats', {
+            'successful_fits': 0,
+            'failed_fits': 0,
+            'fallback_to_mean': 0,
+            'offset_applied': 0
+        })
+        
+        print(f"TBATS checkpoint loaded from {filepath}")
+        print(f"  Models: {len(instance.fitted_models)}, Forecasts: {len(instance.forecasts)}")
+        
+        return instance
 
 
 def fit_parametric_baseline(

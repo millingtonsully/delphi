@@ -21,6 +21,8 @@ import torch
 import numpy as np
 from pathlib import Path
 import sys
+import hashlib
+import json
 from typing import Optional, Dict, Any, Union
 
 # Add project root to path for imports when running from subdirectory
@@ -201,6 +203,60 @@ def _validate_and_convert_config(config: Dict) -> Dict:
     return config
 
 
+def _get_data_files_hash(data_dir: str) -> str:
+    """
+    Compute a hash based on data file modification times.
+    
+    This ensures the cache is invalidated when source data files change,
+    even if the config remains the same.
+    """
+    data_path = Path(data_dir)
+    if not data_path.exists():
+        return "no_data"
+    
+    # Get all data files and their modification times
+    file_info = []
+    for pattern in ['*.csv', '*.parquet', '*.pkl', '*.json']:
+        for f in data_path.glob(f'**/{pattern}'):
+            try:
+                mtime = f.stat().st_mtime
+                file_info.append(f"{f.name}:{mtime}")
+            except OSError:
+                continue
+    
+    # Sort for consistent ordering
+    file_info.sort()
+    
+    # Hash the file info
+    if not file_info:
+        return "empty_data"
+    
+    return hashlib.md5('|'.join(file_info).encode()).hexdigest()[:8]
+
+
+def _compute_config_hash(config: Dict) -> str:
+    """
+    Compute a hash of the config AND data files to detect changes that would invalidate cached sequences.
+    
+    Includes:
+    - Config values that affect sequence preparation (not training hyperparams)
+    - Data file modification timestamps to detect source data changes
+    """
+    # Get data files hash
+    data_dir = config.get('data', {}).get('data_dir', 'data')
+    data_hash = _get_data_files_hash(data_dir)
+    
+    relevant_config = {
+        'data': config.get('data', {}),
+        'preprocessing': config.get('preprocessing', {}),
+        'parametric': config.get('parametric', {}),
+        'training_series_limit': config.get('training_series_limit'),
+        'data_files_hash': data_hash,  # Include data file timestamps
+    }
+    config_str = json.dumps(relevant_config, sort_keys=True, default=str)
+    return hashlib.md5(config_str.encode()).hexdigest()[:12]
+
+
 def set_seed(seed: int):
     """Set random seed for reproducibility."""
     torch.manual_seed(seed)
@@ -252,6 +308,9 @@ def prepare_datasets(splits, config):
     
     This is much faster than per-window fitting while maintaining correct
     residual-based training.
+    
+    Supports checkpointing: prepared sequences are cached to disk and reloaded
+    on subsequent runs if the config hasn't changed.
     """
     import time
     
@@ -271,12 +330,70 @@ def prepare_datasets(splits, config):
         series_list = all_series
     total_series = len(series_list)
     
+    # Check for cached sequences
+    save_dir = Path(config['training']['save_dir'])
+    config_hash = _compute_config_hash(config)
+    cache_path = save_dir / f"prepared_sequences_{config_hash}.npz"
+    tbats_cache_path = save_dir / f"tbats_checkpoint_{config_hash}.pkl"
+    
     print(f"\n{'='*70}")
     print("PREPARING TRAINING DATA WITH RESIDUAL-BASED TARGETS")
     print(f"{'='*70}")
     print(f"Series to process: {total_series}")
     print(f"Sequence length: {seq_len}, Forecast horizon: {horizon}")
     print(f"TBATS parallel workers: {n_parallel_workers}")
+    print(f"Config hash: {config_hash}")
+    
+    # Try to load from cache
+    if cache_path.exists():
+        print(f"\nFound cached sequences at {cache_path}")
+        try:
+            # Use context manager to properly close the NpzFile handle (critical for Windows)
+            with np.load(cache_path) as cached:
+                train_inputs_final = cached['train_inputs'].copy()
+                train_targets_final = cached['train_targets'].copy()
+                train_param_forecasts_final = cached['train_param_forecasts'].copy()
+                val_inputs_array = cached['val_inputs'].copy()
+                val_targets_array = cached['val_targets'].copy()
+                val_param_forecasts_array = cached['val_param_forecasts'].copy()
+            
+            print(f"Loaded {len(train_inputs_final)} training + {len(val_inputs_array)} validation sequences from cache")
+            print(f"{'='*70}\n")
+            
+            # Create datasets directly from cached data
+            train_dataset = TimeSeriesDataset(train_inputs_final, train_targets_final, train_param_forecasts_final)
+            
+            # Get DataLoader settings
+            num_workers = config.get('num_workers', 0)
+            pin_memory = config.get('pin_memory', False)
+            persistent_workers = config.get('persistent_workers', False) and num_workers > 0
+            
+            train_loader = TorchDataLoader(
+                train_dataset,
+                batch_size=config['training']['batch_size'],
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers
+            )
+            
+            val_dataset = TimeSeriesDataset(val_inputs_array, val_targets_array, val_param_forecasts_array)
+            
+            val_loader = TorchDataLoader(
+                val_dataset,
+                batch_size=config['training']['batch_size'],
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers
+            )
+            
+            return train_loader, val_loader
+            
+        except Exception as e:
+            print(f"Failed to load cache: {e}")
+            print("Regenerating sequences...")
+    
     print(f"{'='*70}\n")
     
     # Step 1: Fit TBATS once per series and get fitted values
@@ -459,6 +576,26 @@ def prepare_datasets(splits, config):
     
     print(f"  Training sequences: {len(train_inputs_final)}")
     print(f"  Validation sequences: {len(val_inputs_array)}")
+    
+    # Save sequences to cache for future runs
+    print("\nStep 4: Saving sequences to cache...")
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            train_inputs=train_inputs_final,
+            train_targets=train_targets_final,
+            train_param_forecasts=train_param_forecasts_final,
+            val_inputs=val_inputs_array,
+            val_targets=val_targets_array,
+            val_param_forecasts=val_param_forecasts_array
+        )
+        print(f"  Cached sequences saved to {cache_path}")
+        
+        # Also save TBATS checkpoint for potential future use
+        tbats.save_checkpoint(str(tbats_cache_path))
+    except Exception as e:
+        print(f"  Warning: Failed to save cache: {e}")
     
     # Create datasets
     train_dataset = TimeSeriesDataset(train_inputs_final, train_targets_final, train_param_forecasts_final)

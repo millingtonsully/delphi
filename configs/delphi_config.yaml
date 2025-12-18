@@ -79,9 +79,9 @@ inference:
 
 # Hardware
 device: "cuda"
-num_workers: 8  # Can use all cores during NN training (after TBATS)
+num_workers: 0  # Changed from 8 - CRITICAL FIX for Windows compatibility
 pin_memory: true
-persistent_workers: true  # Faster epoch transitions
+persistent_workers: false  # Changed from true - requires num_workers > 0
 
 # Random seed
 seed: 42
