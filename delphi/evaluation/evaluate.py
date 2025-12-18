@@ -144,6 +144,9 @@ def main():
                        help='Directory to save evaluation results')
     parser.add_argument('--num_series', type=int, default=10000,
                        help='Number of series to evaluate (uses random subset with seed)')
+    # NOTE: Shuffling of series is currently disabled (see selection logic below),
+    # so the seed does not affect which series are chosen at the moment. It is
+    # retained for compatibility and potential future re-enabling of shuffling.
     parser.add_argument('--seed', type=int, default=None,
                        help='Random seed for series subsampling (defaults to config seed or 42)')
     args = parser.parse_args()
@@ -174,7 +177,10 @@ def main():
     if device == 'cuda' and not torch.cuda.is_available():
         device = 'cpu'
     
-    # Random seed for reproducible subsampling
+    # Initialize RNG for potential future use. Currently, selection is
+    # deterministic (no shuffle), so this seed does not affect which series
+    # are evaluated; it is kept here for compatibility and possible re-enabling
+    # of random subsampling.
     seed = args.seed if args.seed is not None else _ensure_numeric(config.get('seed', 42), 42, 'int')
     rng = np.random.default_rng(int(seed))
 
@@ -204,8 +210,15 @@ def main():
     
     # Select subset of series before preprocessing to reduce runtime
     all_series_ids = list(data['main_signal'].keys())
-    rng.shuffle(all_series_ids)
+    # Disable random shuffling so evaluation uses the same deterministic series
+    # ordering as training (first N series). This ensures that when using
+    # training_series_limit=N, evaluation on num_series=N aligns with those
+    # same series.
+    # rng.shuffle(all_series_ids)
     selected_ids = all_series_ids[:args.num_series]
+    # Note: Selection is currently deterministic (first N series); the seed is
+    # reported below for reproducibility/logging only and does not affect which
+    # series are chosen while shuffling remains disabled.
     if len(selected_ids) < len(all_series_ids):
         print(f"Subsampling series: {len(selected_ids)} of {len(all_series_ids)} (seed={seed})")
     else:

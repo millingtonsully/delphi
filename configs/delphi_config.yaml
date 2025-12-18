@@ -79,13 +79,13 @@ inference:
 
 # Hardware
 device: "cuda"
-num_workers: 0  # Changed from 8 - CRITICAL FIX for Windows compatibility
+num_workers: 8  # Parallel data loading (faster training)
 pin_memory: true
-persistent_workers: false  # Changed from true - requires num_workers > 0
+persistent_workers: true  # Faster epoch transitions
 
 # Random seed
 seed: 42
 
 # Training series limit (for faster TBATS fitting)
 # Remove or set to null to use all available series (~1.3M)
-training_series_limit: 50000
+training_series_limit: 1000

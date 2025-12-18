@@ -269,9 +269,18 @@ class DELPHITrainer:
                 
                 # Verify tensors are on correct device (only check first batch)
                 if epoch == 0 and len(train_losses) == 0:
+                    print(f"\n[DEBUG] First batch device check:")
+                    print(f"  inputs.device = {inputs.device}")
+                    print(f"  targets.device = {targets.device}")
+                    print(f"  self.device = {self.device}")
+                    print(f"  Model first param device = {next(self.model.parameters()).device}")
                     if self.device.startswith('cuda'):
                         assert inputs.device.type == 'cuda', f"Inputs on {inputs.device}, expected {self.device}"
                         assert targets.device.type == 'cuda', f"Targets on {targets.device}, expected {self.device}"
+                        # Check memory after moving tensors
+                        import torch
+                        print(f"  GPU memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+                        print(f"  GPU memory reserved: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
                 
                 # Forward pass with future observations for posterior
                 # Reshape targets to (batch, horizon, 1) for posterior
@@ -302,6 +311,12 @@ class DELPHITrainer:
                     )
                     
                     loss = loss_dict['total_loss']
+                
+                # Debug: Check memory after forward pass (first batch only)
+                if epoch == 0 and len(train_losses) == 0:
+                    import torch
+                    print(f"  [After forward] GPU memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+                    print(f"  [After forward] outputs['forecast'].device = {outputs['forecast'].device}")
                 
                 # Backward pass with mixed precision
                 self.optimizer.zero_grad()
