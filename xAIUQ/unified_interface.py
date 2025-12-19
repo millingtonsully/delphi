@@ -108,20 +108,30 @@ class DelphiExplainer:
         report = ExplanationReport(series_id=series_id)
         
         # Get regime shift explanations
+        print("      Computing regime shifts...")
         report.regime_shifts = self.explain_regime_shifts(x, parametric_forecast)
+        print("      ✓ Regime shifts complete")
         
         # Get feature attribution
+        print("      Computing feature attribution (SHAP - this may take a while on CPU)...")
         report.feature_attribution = self.explain_features(x, parametric_forecast)
+        print("      ✓ Feature attribution complete")
         
         # Get regime explanations
+        print("      Computing regime explanations...")
         report.regime_explanation = self._get_regime_explanation(x, parametric_forecast)
+        print("      ✓ Regime explanations complete")
         
         # Get external signal analysis
+        print("      Computing external signal analysis...")
         report.external_signal = self.explain_external_signal(x, parametric_forecast)
+        print("      ✓ External signal analysis complete")
         
         # Get uncertainty quantification
         if include_uncertainty:
+            print("      Computing uncertainty quantification...")
             report.uncertainty = self.quantify_uncertainty(x, parametric_forecast)
+            print("      ✓ Uncertainty quantification complete")
         
         # Combine all into complete report
         report.complete = report.to_dict()

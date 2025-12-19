@@ -1,0 +1,9 @@
+{
+  "num_series_explained": 0,
+  "series_ids": [],
+  "components_generated": [
+    "all"
+  ],
+  "model_path": "checkpoints/best_model_stage2.pt",
+  "results_dir": "evaluation_results_1000"
+}

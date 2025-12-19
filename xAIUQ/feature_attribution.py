@@ -30,6 +30,9 @@ class DELPHIModelWrapper(nn.Module):
     
     GradientExplainer requires a nn.Module that takes input tensor
     and returns output tensor directly.
+    
+    Includes training mode lock to prevent SHAP from switching to eval mode,
+    which is required for cuDNN LSTM gradient computation.
     """
     
     def __init__(self, model, parametric_forecast: Optional[torch.Tensor] = None):
@@ -43,6 +46,35 @@ class DELPHIModelWrapper(nn.Module):
         super().__init__()
         self.model = model
         self.parametric_forecast = parametric_forecast
+        self._training_locked = False  # Lock flag for training mode
+    
+    def lock_training_mode(self):
+        """
+        Lock wrapper and all children in training mode for gradient computation.
+        
+        This prevents SHAP's internal eval() calls from switching the model
+        out of training mode, which is required for cuDNN LSTM backward pass.
+        """
+        self._training_locked = True
+        # Force training mode on entire module tree
+        for module in self.modules():
+            module.training = True
+    
+    def unlock_training_mode(self):
+        """Unlock training mode, allowing normal train/eval switching."""
+        self._training_locked = False
+    
+    def train(self, mode: bool = True):
+        """Override train to respect training lock."""
+        if self._training_locked:
+            return self  # Ignore mode changes when locked
+        return super().train(mode)
+    
+    def eval(self):
+        """Override eval to respect training lock."""
+        if self._training_locked:
+            return self  # Ignore eval calls when locked
+        return super().eval()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -116,7 +148,8 @@ class TimeSeriesFeatureAttribution:
                 - per_timestep_importance: (n_features, horizon) - per forecast timestep
                 - expected_value: Expected model output at baseline
         """
-        model.eval()
+        # Note: We don't set model.eval() here - _compute_gradient_shap handles mode switching
+        # because cuDNN RNN backward requires training mode for gradient computation
         device = x.device
         batch_size, seq_len, n_features = x.shape
         
@@ -128,9 +161,9 @@ class TimeSeriesFeatureAttribution:
         background = background.to(device)
         
         # Create model wrapper for GradientExplainer
+        # Note: wrapper inherits model's current training mode
         wrapper = DELPHIModelWrapper(model, parametric_forecast)
         wrapper.to(device)
-        wrapper.eval()
         
         # Get horizon from a test forward pass
         with torch.no_grad():
@@ -216,6 +249,10 @@ class TimeSeriesFeatureAttribution:
             Tuple of (shap_values, expected_value):
                 - shap_values: (batch, seq_len, n_features, horizon)
                 - expected_value: (horizon,) - mean prediction on background
+        
+        Note:
+            cuDNN RNN backward pass only works in training mode, so we temporarily
+            enable training mode during gradient computation for SHAP values.
         """
         batch_size, seq_len, n_features = x.shape
         device = x.device
@@ -224,44 +261,88 @@ class TimeSeriesFeatureAttribution:
         all_shap_values = np.zeros((batch_size, seq_len, n_features, horizon))
         expected_values = np.zeros(horizon)
         
-        # Compute expected value (baseline prediction)
+        # Compute expected value (baseline prediction) - can use eval mode for this
         with torch.no_grad():
             baseline_pred = wrapper(background).mean(dim=0)  # (horizon,)
             expected_values = baseline_pred.cpu().numpy()
         
-        # GradientSHAP for each output dimension (horizon timestep)
-        # We need to create separate explainers or handle multi-output
-        for t in range(horizon):
-            # Create wrapper for single output timestep
-            class SingleOutputWrapper(nn.Module):
-                def __init__(self, base_wrapper, timestep):
-                    super().__init__()
-                    self.base_wrapper = base_wrapper
-                    self.timestep = timestep
+        # IMPORTANT: Enable training mode for cuDNN LSTM backward compatibility
+        # cuDNN's optimized RNN backward pass only works in training mode
+        # Save the inner model's training state (not just wrapper's) since that's what matters
+        inner_model = wrapper.model
+        was_training = inner_model.training
+        
+        # Lock training mode to prevent SHAP from calling eval() internally
+        # This is critical because SHAP's GradientExplainer may switch the model to eval mode
+        wrapper.lock_training_mode()
+        
+        try:
+            # GradientSHAP for each output dimension (horizon timestep)
+            # We need to create separate explainers or handle multi-output
+            print(f"        Computing SHAP values for {horizon} horizon timesteps...")
+            for t in range(horizon):
+                if (t + 1) % 5 == 0 or t == 0 or t == horizon - 1:
+                    print(f"          Processing timestep {t+1}/{horizon}...")
+                # Create wrapper for single output timestep
+                class SingleOutputWrapper(nn.Module):
+                    def __init__(self, base_wrapper, timestep):
+                        super().__init__()
+                        self.base_wrapper = base_wrapper
+                        self.timestep = timestep
+                    
+                    def forward(self, x):
+                        full_output = self.base_wrapper(x)
+                        return full_output[:, self.timestep:self.timestep+1]
                 
-                def forward(self, x):
-                    full_output = self.base_wrapper(x)
-                    return full_output[:, self.timestep:self.timestep+1]
+                single_wrapper = SingleOutputWrapper(wrapper, t)
+                single_wrapper.to(device)
+                single_wrapper.train()  # Ensure inner wrapper is also in train mode
+                
+                # Create GradientExplainer for this timestep
+                explainer = shap.GradientExplainer(single_wrapper, background)
+                
+                # Compute SHAP values
+                # Returns list with one element per output (we have 1 output)
+                shap_vals = explainer.shap_values(x)
+                
+                # Handle different SHAP return formats
+                if isinstance(shap_vals, list):
+                    shap_vals = shap_vals[0]  # Single output
+                
+                # Convert to numpy
+                if isinstance(shap_vals, torch.Tensor):
+                    shap_vals = shap_vals.detach().cpu().numpy()
+                else:
+                    shap_vals = np.array(shap_vals)
+                
+                # Expected target shape: (batch_size, seq_len, n_features)
+                # Some SHAP/model combos return (seq_len, n_features, batch_size) instead
+                if shap_vals.shape == (batch_size, seq_len, n_features):
+                    # Already in (batch, seq, feature) format
+                    pass
+                elif shap_vals.shape == (seq_len, n_features, batch_size):
+                    # Reorder to (batch, seq, feature)
+                    shap_vals = np.transpose(shap_vals, (2, 0, 1))
+                else:
+                    # Fallback: try to reshape safely if total size matches
+                    if shap_vals.size == batch_size * seq_len * n_features:
+                        shap_vals = shap_vals.reshape(batch_size, seq_len, n_features)
+                    else:
+                        raise ValueError(
+                            f"Unexpected SHAP values shape {shap_vals.shape}, "
+                            f"expected (batch={batch_size}, seq_len={seq_len}, n_features={n_features}) "
+                            f"or (seq_len, n_features, batch)."
+                        )
+                
+                # Now guaranteed (batch, seq_len, n_features)
+                all_shap_values[:, :, :, t] = shap_vals
             
-            single_wrapper = SingleOutputWrapper(wrapper, t)
-            single_wrapper.to(device)
-            
-            # Create GradientExplainer for this timestep
-            explainer = shap.GradientExplainer(single_wrapper, background)
-            
-            # Compute SHAP values
-            # Returns list with one element per output (we have 1 output)
-            shap_vals = explainer.shap_values(x)
-            
-            # Handle different SHAP return formats
-            if isinstance(shap_vals, list):
-                shap_vals = shap_vals[0]  # Single output
-            
-            # shap_vals shape: (batch, seq_len, n_features)
-            if isinstance(shap_vals, torch.Tensor):
-                shap_vals = shap_vals.cpu().numpy()
-            
-            all_shap_values[:, :, :, t] = shap_vals
+            print(f"        ✓ Completed SHAP computation for all {horizon} timesteps")
+        finally:
+            # Unlock training mode and restore original state
+            wrapper.unlock_training_mode()
+            if not was_training:
+                wrapper.eval()  # Recursively sets all children (including inner model) to eval mode
         
         return all_shap_values, expected_values
     

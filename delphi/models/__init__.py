@@ -1,12 +1,12 @@
 """
 DELPHI model components.
 
-All models use xLSTM (Extended LSTM) with exponential gating for enhanced
-long-term memory and improved time series forecasting.
+Uses cuDNN-optimized LSTM for fast training (xLSTM wrapper with compatible API).
+Original xLSTM with exponential gating available as xLSTM_Original if needed.
 """
 
 from .parametric import TBATSBaseline, fit_parametric_baseline
-from .xlstm_layer import xLSTM, xLSTMCell, xLSTMLayer
+from .xlstm_layer import xLSTM, xLSTM_Original, xLSTMCell_Original
 from .hmm_gating import VariationalHMMGating
 from .ensemble_correctors import (
     EnsembleMember,
@@ -22,8 +22,8 @@ __all__ = [
     'TBATSBaseline',
     'fit_parametric_baseline',
     'xLSTM',
-    'xLSTMCell',
-    'xLSTMLayer',
+    'xLSTM_Original',
+    'xLSTMCell_Original',
     'VariationalHMMGating',
     'EnsembleMember',
     'TrendCorrectorRNN',

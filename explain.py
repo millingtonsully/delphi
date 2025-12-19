@@ -175,11 +175,9 @@ def main():
     explanations_dir = output_dir / "explanations_by_series"
     explanations_dir.mkdir(exist_ok=True)
     
-    # Initialize device
-    device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-    if device == 'cuda' and not torch.cuda.is_available():
-        device = 'cpu'
-    
+    # Initialize device (force CPU for explanations to avoid GPU OOM)
+    device = 'cpu'
+    print("Forcing device to CPU for explanations to avoid GPU out-of-memory issues.")
     print(f"Using device: {device}")
     
     # Model configuration
@@ -328,24 +326,30 @@ def main():
         # Generate explanations
         try:
             if 'all' in args.components:
+                print("    Running full explanation (regime_shifts, features, regime, external_signal, uncertainty)...")
                 report = explainer.explain(inputs, param_tensor, include_uncertainty=True, series_id=series_id)
                 explanation_dict = report.to_dict()
             else:
                 explanation_dict = {'series_id': series_id}
                 
                 if 'regime_shifts' in args.components:
+                    print("    Running component: regime_shifts")
                     explanation_dict['regime_shifts'] = explainer.explain_regime_shifts(inputs, param_tensor)
                 
                 if 'features' in args.components:
+                    print("    Running component: features")
                     explanation_dict['feature_attribution'] = explainer.explain_features(inputs, param_tensor)
                 
                 if 'regime' in args.components:
+                    print("    Running component: regime")
                     explanation_dict['regime_explanation'] = explainer._get_regime_explanation(inputs, param_tensor)
                 
                 if 'external_signal' in args.components:
+                    print("    Running component: external_signal")
                     explanation_dict['external_signal'] = explainer.explain_external_signal(inputs, param_tensor)
                 
                 if 'uncertainty' in args.components:
+                    print("    Running component: uncertainty")
                     explanation_dict['uncertainty'] = explainer.quantify_uncertainty(inputs, param_tensor)
             
             # Save individual components
