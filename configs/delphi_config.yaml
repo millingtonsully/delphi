@@ -87,5 +87,4 @@ persistent_workers: true  # Faster epoch transitions
 seed: 42
 
 # Training series limit (for faster TBATS fitting)
-# Remove or set to null to use all available series (~1.3M)
-training_series_limit: 1000
+training_series_limit: null
