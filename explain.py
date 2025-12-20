@@ -15,6 +15,13 @@ from pathlib import Path
 import os
 from typing import Any, Union, Optional, Dict
 
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Warning: psutil not available. Memory monitoring disabled.")
+
 from delphi.models.delphi_core import DELPHICore
 from delphi.models.parametric import TBATSBaseline
 from delphi.data import (
@@ -46,6 +53,41 @@ def _ensure_numeric(
         return float(value)
     except (ValueError, TypeError):
         return default if default is not None else 0
+
+
+def get_memory_usage_mb() -> float:
+    """
+    Get current memory usage in MB.
+    
+    Returns:
+        Memory usage in megabytes (MB), or 0.0 if psutil is not available
+    """
+    if not PSUTIL_AVAILABLE:
+        return 0.0
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024  # Convert bytes to MB
+
+
+def check_memory_threshold(current_memory_mb: float, warning_threshold_mb: float = 8192, 
+                           critical_threshold_mb: float = 16384) -> bool:
+    """
+    Check if memory usage exceeds thresholds and alert.
+    
+    Args:
+        current_memory_mb: Current memory usage in MB
+        warning_threshold_mb: Memory threshold for warning (default: 8GB)
+        critical_threshold_mb: Memory threshold for critical alert (default: 16GB)
+    
+    Returns:
+        True if memory usage is critical, False otherwise
+    """
+    if current_memory_mb >= critical_threshold_mb:
+        print(f"    ⚠️  CRITICAL: Memory usage {current_memory_mb:.1f} MB exceeds critical threshold {critical_threshold_mb:.1f} MB")
+        return True
+    elif current_memory_mb >= warning_threshold_mb:
+        print(f"    ⚠️  WARNING: Memory usage {current_memory_mb:.1f} MB exceeds warning threshold {warning_threshold_mb:.1f} MB")
+        return False
+    return False
 
 
 def load_model(checkpoint_path: str, model_config: Dict, device: str) -> DELPHICore:
@@ -277,6 +319,14 @@ def main():
     for idx, series_id in enumerate(series_to_explain, 1):
         print(f"  Processing {idx}/{len(series_to_explain)}: {series_id}")
         
+        # Memory monitoring: before processing
+        memory_before = get_memory_usage_mb()
+        print(f"    Memory before: {memory_before:.1f} MB")
+        is_critical = check_memory_threshold(memory_before)
+        if is_critical:
+            print(f"    ⚠️  Skipping {series_id} due to critical memory usage")
+            continue
+        
         train_history = train_main.get(series_id, np.array([]))
         val_history = val_main.get(series_id, np.array([]))
         history_main = np.concatenate([train_history, val_history])
@@ -395,8 +445,44 @@ def main():
             
             all_explanations.append(explanation_dict)
             
+            # Memory cleanup after each series
+            del explanation_dict, inputs, param_tensor
+            if 'all' in args.components:
+                try:
+                    del report
+                except NameError:
+                    pass  # report not defined if using individual components
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()  # Clear CUDA cache if available
+            
+            # Memory monitoring: after processing
+            memory_after = get_memory_usage_mb()
+            memory_delta = memory_after - memory_before
+            print(f"    Memory after: {memory_after:.1f} MB (Δ {memory_delta:+.1f} MB)")
+            check_memory_threshold(memory_after)
+            
         except Exception as e:
             print(f"    Error explaining {series_id}: {e}")
+            # Memory cleanup on error
+            try:
+                del explanation_dict, inputs, param_tensor
+                if 'all' in args.components:
+                    try:
+                        del report
+                    except NameError:
+                        pass
+            except NameError:
+                pass  # Variables may not exist if error occurred early
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # Memory monitoring: after error
+            memory_after = get_memory_usage_mb()
+            memory_delta = memory_after - memory_before
+            print(f"    Memory after error: {memory_after:.1f} MB (Δ {memory_delta:+.1f} MB)")
             continue
     
     # Save summary

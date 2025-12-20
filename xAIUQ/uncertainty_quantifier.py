@@ -151,12 +151,12 @@ class UncertaintyQuantifier:
         epistemic_uncertainty = torch.clamp(epistemic_uncertainty, min=0.0)
         
         return {
-            'mean_forecast': mean_forecast.cpu().numpy(),
-            'total_uncertainty': std_forecast.cpu().numpy(),
-            'aleatoric_uncertainty': aleatoric_uncertainty.cpu().numpy(),
-            'epistemic_uncertainty': epistemic_uncertainty.cpu().numpy(),
-            'samples': samples.cpu().numpy(),
-            'state_samples': state_samples.cpu().numpy(),
+            'mean_forecast': mean_forecast.detach().cpu().numpy(),
+            'total_uncertainty': std_forecast.detach().cpu().numpy(),
+            'aleatoric_uncertainty': aleatoric_uncertainty.detach().cpu().numpy(),
+            'epistemic_uncertainty': epistemic_uncertainty.detach().cpu().numpy(),
+            'samples': samples.detach().cpu().numpy(),
+            'state_samples': state_samples.detach().cpu().numpy(),
             'num_samples': num_samples
         }
     
@@ -196,12 +196,12 @@ class UncertaintyQuantifier:
         high_uncertainty_mask = normalized_uncertainty > high_uncertainty_threshold
         
         return {
-            'entropy': entropy.cpu().numpy(),
-            'normalized_uncertainty': normalized_uncertainty.cpu().numpy(),
-            'confidence': confidence.cpu().numpy(),
+            'entropy': entropy.detach().cpu().numpy(),
+            'normalized_uncertainty': normalized_uncertainty.detach().cpu().numpy(),
+            'confidence': confidence.detach().cpu().numpy(),
             'mean_uncertainty': float(normalized_uncertainty.mean().item()),
             'max_uncertainty': float(normalized_uncertainty.max().item()),
-            'high_uncertainty_timesteps': high_uncertainty_mask.cpu().numpy(),
+            'high_uncertainty_timesteps': high_uncertainty_mask.detach().cpu().numpy(),
             'max_entropy': max_entropy
         }
     
@@ -257,12 +257,12 @@ class UncertaintyQuantifier:
         upper_bound = mean_forecast + z_score * adjusted_uncertainty
         
         return {
-            'mean_forecast': mean_forecast.numpy(),
-            'lower_bound': lower_bound.numpy(),
-            'upper_bound': upper_bound.numpy(),
+            'mean_forecast': mean_forecast.detach().numpy(),
+            'lower_bound': lower_bound.detach().numpy(),
+            'upper_bound': upper_bound.detach().numpy(),
             'confidence_level': confidence_level,
-            'adjusted_uncertainty': adjusted_uncertainty.numpy(),
-            'regime_uncertainty': regime_uncertainty.numpy(),
-            'adjustment_factor': adjustment_factor.numpy()
+            'adjusted_uncertainty': adjusted_uncertainty.detach().numpy(),
+            'regime_uncertainty': regime_uncertainty.detach().numpy(),
+            'adjustment_factor': adjustment_factor.detach().numpy()
         }
 

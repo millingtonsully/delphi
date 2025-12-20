@@ -12,6 +12,7 @@ import torch.nn as nn
 import numpy as np
 from typing import Dict, Optional
 import warnings
+import gc
 
 try:
     import shap
@@ -128,7 +129,7 @@ class TimeSeriesFeatureAttribution:
         x: torch.Tensor,
         parametric_forecast: Optional[torch.Tensor] = None,
         background: Optional[torch.Tensor] = None,
-        n_background_samples: int = 50
+        n_background_samples: int = 10  # Reduced for CPU memory efficiency
     ) -> Dict:
         """
         Compute SHAP values using GradientSHAP (Expected Gradients).
@@ -175,9 +176,17 @@ class TimeSeriesFeatureAttribution:
             wrapper, x, background, horizon
         )
         
+        # MEMORY OPTIMIZATION: Delete wrapper immediately (no longer needed)
+        del wrapper
+        gc.collect()
+        
         # shap_values shape: (batch, seq_len, n_features, horizon)
         # Average over batch to get (seq_len, n_features, horizon)
         attributions = shap_values.mean(axis=0)
+        
+        # MEMORY OPTIMIZATION: Delete large array immediately after processing
+        del shap_values
+        gc.collect()
         
         # Compute overall feature importance (aggregated over time and horizon)
         feature_importance = np.abs(attributions).sum(axis=(0, 2))  # (n_features,)
@@ -265,6 +274,8 @@ class TimeSeriesFeatureAttribution:
         with torch.no_grad():
             baseline_pred = wrapper(background).mean(dim=0)  # (horizon,)
             expected_values = baseline_pred.cpu().numpy()
+            del baseline_pred  # Clean up immediately to free memory
+            gc.collect()  # Force garbage collection
         
         # IMPORTANT: Enable training mode for cuDNN LSTM backward compatibility
         # cuDNN's optimized RNN backward pass only works in training mode
@@ -336,6 +347,16 @@ class TimeSeriesFeatureAttribution:
                 
                 # Now guaranteed (batch, seq_len, n_features)
                 all_shap_values[:, :, :, t] = shap_vals
+                
+                # Memory cleanup after each timestep
+                del shap_vals, explainer, single_wrapper
+                gc.collect()  # Force garbage collection after every timestep
+                
+                # Additional cleanup for CPU memory
+                if device.type == 'cpu':
+                    # Clear any cached computations
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()  # Clear CUDA cache if available
             
             print(f"        ✓ Completed SHAP computation for all {horizon} timesteps")
         finally:
@@ -343,6 +364,11 @@ class TimeSeriesFeatureAttribution:
             wrapper.unlock_training_mode()
             if not was_training:
                 wrapper.eval()  # Recursively sets all children (including inner model) to eval mode
+            
+            # MEMORY OPTIMIZATION: Delete background tensor after all timesteps complete
+            # It's no longer needed after SHAP computation
+            del background
+            gc.collect()
         
         return all_shap_values, expected_values
     
@@ -367,7 +393,7 @@ class TimeSeriesFeatureAttribution:
         """
         # Compute SHAP attributions
         attribution_results = self.compute_shap_values(
-            model, x, parametric_forecast, background
+            model, x, parametric_forecast, background, n_background_samples=10  # Reduced for CPU memory efficiency
         )
         
         # Get temporal importance analysis
