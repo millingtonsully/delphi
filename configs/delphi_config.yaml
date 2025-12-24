@@ -6,7 +6,7 @@ data:
   data_dir: "data"
   train_end_week: 209  # End of 2018 (Weeks 1-209)
   val_end_week: 261     # End of 2019 (Weeks 210-261)
-  forecast_horizon: 26  # 26 weeks ahead
+  forecast_horizon: 52  # 26 weeks ahead
   seasonal_period: 52  # Weekly data, annual seasonality
 
 # Preprocessing

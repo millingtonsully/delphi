@@ -1,0 +1,495 @@
+{
+  "mase_components": [
+    {
+      "series_id": "br_female_outerwear_0",
+      "mase": 0.3596838304589583,
+      "T": 209,
+      "m": 52,
+      "h": 52,
+      "sum_forecast_errors": 0.05682324786898062,
+      "mean_forecast_error": 0.0010927547667111657,
+      "sum_seasonal_naive_errors": 0.47698140379215387,
+      "mean_seasonal_naive_error": 0.003038098113325821,
+      "scaling_factor": 3.019230769230769,
+      "error_ratio": 0.11913095021570594
+    },
+    {
+      "series_id": "br_female_outerwear_1",
+      "mase": 0.2904747395763708,
+      "T": 209,
+      "m": 52,
+      "h": 52,
+      "sum_forecast_errors": 0.06781152561793483,
+      "mean_forecast_error": 0.0013040678003449005,
+      "sum_seasonal_naive_errors": 0.7048414776195024,
+      "mean_seasonal_naive_error": 0.004489436163181544,
+      "scaling_factor": 3.019230769230769,
+      "error_ratio": 0.09620819399981709
+    },
+    {
+      "series_id": "br_female_outerwear_2",
+      "mase": 0.21571635642055692,
+      "T": 209,
+      "m": 52,
+      "h": 52,
+      "sum_forecast_errors": 0.045903839873355494,
+      "mean_forecast_error": 0.0008827661514106826,
+      "sum_seasonal_naive_errors": 0.6424838990942165,
+      "mean_seasonal_naive_error": 0.004092254134358067,
+      "scaling_factor": 3.019230769230769,
+      "error_ratio": 0.0714474556297386
+    },
+    {
+      "series_id": "br_female_outerwear_3",
+      "mase": 0.29725329203169426,
+      "T": 209,
+      "m": 52,
+      "h": 52,
+      "sum_forecast_errors": 0.04718242157191778,
+      "mean_forecast_error": 0.0009073542609984188,
+      "sum_seasonal_naive_errors": 0.4792364720440597,
+      "mean_seasonal_naive_error": 0.0030524616053761765,
+      "scaling_factor": 3.019230769230769,
+      "error_ratio": 0.09845331965380956
+    },
+    {
+      "series_id": "br_female_outerwear_4",
+      "mase": 0.32014338013265703,
+      "T": 209,
+      "m": 52,
+      "h": 52,
+      "sum_forecast_errors": 0.0966572533726729,
+      "mean_forecast_error": 0.0018587933340898635,
+      "sum_seasonal_naive_errors": 0.9115620423923289,
+      "mean_seasonal_naive_error": 0.005806127658549865,
+      "scaling_factor": 3.019230769230769,
+      "error_ratio": 0.10603475010763164
+    }
+  ],
+  "reseasonalization_info": [
+    {
+      "series_id": "br_female_outerwear_0",
+      "needs_forecasting": false,
+      "seasonal_components_length": 52,
+      "forecast_length": 52,
+      "seasonal_mean": -8.159626232753828e-05,
+      "seasonal_std": 0.0031859565302357795,
+      "deseasonalized_forecast_mean": "0.009702216",
+      "reseasonalized_forecast_mean": 0.009620619210338579,
+      "true_values_mean": 0.009118003091732897
+    },
+    {
+      "series_id": "br_female_outerwear_1",
+      "needs_forecasting": false,
+      "seasonal_components_length": 52,
+      "forecast_length": 52,
+      "seasonal_mean": -2.483997200692401e-05,
+      "seasonal_std": 0.004875820644283971,
+      "deseasonalized_forecast_mean": "0.014010131",
+      "reseasonalized_forecast_mean": 0.013985291064712526,
+      "true_values_mean": 0.013662306029408435
+    },
+    {
+      "series_id": "br_female_outerwear_2",
+      "needs_forecasting": false,
+      "seasonal_components_length": 52,
+      "forecast_length": 52,
+      "seasonal_mean": -2.5120339000484222e-05,
+      "seasonal_std": 0.004005203895043887,
+      "deseasonalized_forecast_mean": "0.011640905",
+      "reseasonalized_forecast_mean": 0.011615783881537016,
+      "true_values_mean": 0.011776752065291591
+    },
+    {
+      "series_id": "br_female_outerwear_3",
+      "needs_forecasting": false,
+      "seasonal_components_length": 52,
+      "forecast_length": 52,
+      "seasonal_mean": 3.427523954690039e-05,
+      "seasonal_std": 0.0034952421828180354,
+      "deseasonalized_forecast_mean": "0.008642545",
+      "reseasonalized_forecast_mean": 0.008676820102002948,
+      "true_values_mean": 0.008281756413593888
+    },
+    {
+      "series_id": "br_female_outerwear_4",
+      "needs_forecasting": false,
+      "seasonal_components_length": 52,
+      "forecast_length": 52,
+      "seasonal_mean": 0.00012003015358439527,
+      "seasonal_std": 0.01061135426601879,
+      "deseasonalized_forecast_mean": "0.028663354",
+      "reseasonalized_forecast_mean": 0.028783382643628955,
+      "true_values_mean": 0.02993296795175949
+    }
+  ],
+  "scale_comparisons": [
+    {
+      "series_id": "br_female_outerwear_0",
+      "deseasonalized_range": [
+        "0.009242939",
+        "0.010025859"
+      ],
+      "reseasonalized_range": [
+        0.003169703269188178,
+        0.018167296361689927
+      ],
+      "true_range": [
+        0.0036981199692547,
+        0.0175676508269078
+      ],
+      "scale_diff_ratio": 0.1198457115291864
+    },
+    {
+      "series_id": "br_female_outerwear_1",
+      "deseasonalized_range": [
+        "0.013747606",
+        "0.014303229"
+      ],
+      "reseasonalized_range": [
+        0.0062241206824027746,
+        0.026834331228677358
+      ],
+      "true_range": [
+        0.0056193380926257,
+        0.0277054379436596
+      ],
+      "scale_diff_ratio": 0.09544998062831118
+    },
+    {
+      "series_id": "br_female_outerwear_2",
+      "deseasonalized_range": [
+        "0.011384831",
+        "0.011930088"
+      ],
+      "reseasonalized_range": [
+        0.004359086407856354,
+        0.021296520373825914
+      ],
+      "true_range": [
+        0.0052887887930595,
+        0.0216825166515596
+      ],
+      "scale_diff_ratio": 0.07495830742920129
+    },
+    {
+      "series_id": "br_female_outerwear_3",
+      "deseasonalized_range": [
+        "0.008361438",
+        "0.008972578"
+      ],
+      "reseasonalized_range": [
+        0.0014006627398239586,
+        0.020750640458935293
+      ],
+      "true_range": [
+        0.0029524003882897,
+        0.0203606280514837
+      ],
+      "scale_diff_ratio": 0.10956047486549078
+    },
+    {
+      "series_id": "br_female_outerwear_4",
+      "deseasonalized_range": [
+        "0.028218811",
+        "0.02906436"
+      ],
+      "reseasonalized_range": [
+        0.011483176113357318,
+        0.05074072438938039
+      ],
+      "true_range": [
+        0.013313790611587,
+        0.0521986511981992
+      ],
+      "scale_diff_ratio": 0.062098510114347034
+    }
+  ],
+  "scale_analysis": [
+    {
+      "series_id": "br_female_outerwear_0",
+      "original_train_stats": {
+        "mean": 0.010730741201299935,
+        "std": 0.0049371251497887765,
+        "min": 0.0,
+        "max": 0.0320910003371125
+      },
+      "deseasonalized_train_stats": {
+        "mean": 0.01080578266864602,
+        "std": 0.0032276332326408247,
+        "min": -0.009275749132185833,
+        "max": 0.024895356610299207
+      },
+      "deseasonalized_test_stats": {
+        "mean": 0.009199599354060438,
+        "std": 0.001960248488452256,
+        "min": -0.00041784625994206043,
+        "max": 0.011596782904206153
+      },
+      "original_test_stats": {
+        "mean": 0.009118003091732897,
+        "std": 0.003344309964274315,
+        "min": 0.0036981199692547,
+        "max": 0.0175676508269078
+      },
+      "tbats_forecast_stats": {
+        "mean": 0.009701953408860469,
+        "std": 4.7280333693344815e-05,
+        "min": 0.009498626885926734,
+        "max": 0.009723581225865495
+      },
+      "model_correction_stats": {
+        "mean": "2.620755e-07",
+        "std": "0.00011607461",
+        "min": "-0.0003006794",
+        "max": "0.00030262282"
+      },
+      "deseasonalized_forecast_stats": {
+        "mean": "0.009702216",
+        "std": "0.0001329236",
+        "min": "0.009242939",
+        "max": "0.010025859"
+      },
+      "seasonal_components_stats": {
+        "mean": -8.159626232753828e-05,
+        "std": 0.0031859565302357795,
+        "min": -0.0064803120030119295,
+        "max": 0.008479312930767896
+      },
+      "scale_ratios": {
+        "pred_to_test_deseasonalized": 1.0546334663900736,
+        "pred_to_test_original": 1.0551223291246843,
+        "train_deseasonalized_to_original": 1.0069921915007214,
+        "test_deseasonalized_to_original": 1.0089478114921235
+      }
+    },
+    {
+      "series_id": "br_female_outerwear_1",
+      "original_train_stats": {
+        "mean": 0.015038743235176526,
+        "std": 0.006681522158691156,
+        "min": 0.0,
+        "max": 0.0326826196230922
+      },
+      "deseasonalized_train_stats": {
+        "mean": 0.015116144170707025,
+        "std": 0.0038328415098255408,
+        "min": -0.0002749370047889707,
+        "max": 0.03603366229602302
+      },
+      "deseasonalized_test_stats": {
+        "mean": 0.01368714600141536,
+        "std": 0.0015101388897188134,
+        "min": 0.010357563179327567,
+        "max": 0.01646904026034017
+      },
+      "original_test_stats": {
+        "mean": 0.013662306029408435,
+        "std": 0.00498604198765,
+        "min": 0.0056193380926257,
+        "max": 0.0277054379436596
+      },
+      "tbats_forecast_stats": {
+        "mean": 0.014002841692958236,
+        "std": 5.831665315565435e-06,
+        "min": 0.014000172862960143,
+        "max": 0.014027913917776955
+      },
+      "model_correction_stats": {
+        "mean": "7.2893117e-06",
+        "std": "0.000112167894",
+        "min": "-0.00027476245",
+        "max": "0.00030301328"
+      },
+      "deseasonalized_forecast_stats": {
+        "mean": "0.014010131",
+        "std": "0.00011126017",
+        "min": "0.013747606",
+        "max": "0.014303229"
+      },
+      "seasonal_components_stats": {
+        "mean": -2.483997200692401e-05,
+        "std": 0.004875820644283971,
+        "min": -0.007523485744074658,
+        "max": 0.012630097343865956
+      },
+      "scale_ratios": {
+        "pred_to_test_deseasonalized": 1.0235969662106272,
+        "pred_to_test_original": 1.0236398451484272,
+        "train_deseasonalized_to_original": 1.0051461004991742,
+        "test_deseasonalized_to_original": 1.001817405771721
+      }
+    },
+    {
+      "series_id": "br_female_outerwear_2",
+      "original_train_stats": {
+        "mean": 0.01252309590499533,
+        "std": 0.005641537732299938,
+        "min": 0.0,
+        "max": 0.0261129910605733
+      },
+      "deseasonalized_train_stats": {
+        "mean": 0.012589451639297209,
+        "std": 0.003449632995986148,
+        "min": 0.0005892543951549079,
+        "max": 0.02479285417047388
+      },
+      "deseasonalized_test_stats": {
+        "mean": 0.011801872404292079,
+        "std": 0.0010763308538908562,
+        "min": 0.009802730688030338,
+        "max": 0.014009451161636934
+      },
+      "original_test_stats": {
+        "mean": 0.011776752065291591,
+        "std": 0.004141083140183466,
+        "min": 0.0052887887930595,
+        "max": 0.0216825166515596
+      },
+      "tbats_forecast_stats": {
+        "mean": 0.011641432597502915,
+        "std": 8.811236028396354e-06,
+        "min": 0.01163740228113952,
+        "max": 0.011679327975968105
+      },
+      "model_correction_stats": {
+        "mean": "-5.284013e-07",
+        "std": "0.000110388035",
+        "min": "-0.00028610966",
+        "max": "0.00029262053"
+      },
+      "deseasonalized_forecast_stats": {
+        "mean": "0.011640905",
+        "std": "0.00010921886",
+        "min": "0.011384831",
+        "max": "0.011930088"
+      },
+      "seasonal_components_stats": {
+        "mean": -2.5120339000484222e-05,
+        "std": 0.004005203895043887,
+        "min": -0.007025744402273289,
+        "max": 0.009458657941822891
+      },
+      "scale_ratios": {
+        "pred_to_test_deseasonalized": 0.986360057135227,
+        "pred_to_test_original": 0.9863308621790866,
+        "train_deseasonalized_to_original": 1.005297865785469,
+        "test_deseasonalized_to_original": 1.002132193794973
+      }
+    },
+    {
+      "series_id": "br_female_outerwear_3",
+      "original_train_stats": {
+        "mean": 0.00905677540430782,
+        "std": 0.004265408292256336,
+        "min": 0.0,
+        "max": 0.0259784288443292
+      },
+      "deseasonalized_train_stats": {
+        "mean": 0.009034411362210637,
+        "std": 0.0026829259048647127,
+        "min": -0.003919004084904528,
+        "max": 0.023299286736623345
+      },
+      "deseasonalized_test_stats": {
+        "mean": 0.008247481174046988,
+        "std": 0.0012466845239281737,
+        "min": 0.006380094886632159,
+        "max": 0.014931860242721117
+      },
+      "original_test_stats": {
+        "mean": 0.008281756413593888,
+        "std": 0.0034514656558880716,
+        "min": 0.0029524003882897,
+        "max": 0.0203606280514837
+      },
+      "tbats_forecast_stats": {
+        "mean": 0.008643276926817635,
+        "std": 5.426155229802659e-06,
+        "min": 0.008640794815294825,
+        "max": 0.008666611971176453
+      },
+      "model_correction_stats": {
+        "mean": "-7.3204234e-07",
+        "std": "0.00011918676",
+        "min": "-0.00030000973",
+        "max": "0.00033174327"
+      },
+      "deseasonalized_forecast_stats": {
+        "mean": "0.008642545",
+        "std": "0.00011825734",
+        "min": "0.008361438",
+        "max": "0.008972578"
+      },
+      "seasonal_components_stats": {
+        "mean": 3.427523954690039e-05,
+        "std": 0.0034952421828180354,
+        "min": -0.007175742494810918,
+        "max": 0.011957890852862392
+      },
+      "scale_ratios": {
+        "pred_to_test_deseasonalized": 1.0478998749477297,
+        "pred_to_test_original": 1.04770162169276,
+        "train_deseasonalized_to_original": 0.9975295823961403,
+        "test_deseasonalized_to_original": 0.9958601537601177
+      }
+    },
+    {
+      "series_id": "br_female_outerwear_4",
+      "original_train_stats": {
+        "mean": 0.029709462106570855,
+        "std": 0.011168668703525356,
+        "min": 0.0,
+        "max": 0.058770755119082
+      },
+      "deseasonalized_train_stats": {
+        "mean": 0.029685273155527856,
+        "std": 0.005063898136781437,
+        "min": 0.006887038778996081,
+        "max": 0.05025901214325772
+      },
+      "deseasonalized_test_stats": {
+        "mean": 0.0298129377981751,
+        "std": 0.002653895947784613,
+        "min": 0.02460263150871181,
+        "max": 0.04349676512648522
+      },
+      "original_test_stats": {
+        "mean": 0.02993296795175949,
+        "std": 0.010384899555034402,
+        "min": 0.013313790611587,
+        "max": 0.0521986511981992
+      },
+      "tbats_forecast_stats": {
+        "mean": 0.02865308896966752,
+        "std": 0.00017710619864311076,
+        "min": 0.02835241724639559,
+        "max": 0.028954243517517617
+      },
+      "model_correction_stats": {
+        "mean": "1.0263377e-05",
+        "std": "0.00011791719",
+        "min": "-0.00031030687",
+        "max": "0.00027445212"
+      },
+      "deseasonalized_forecast_stats": {
+        "mean": "0.028663354",
+        "std": "0.00021409919",
+        "min": "0.028218811",
+        "max": "0.02906436"
+      },
+      "seasonal_components_stats": {
+        "mean": 0.00012003015358439527,
+        "std": 0.01061135426601879,
+        "min": -0.017209516404876935,
+        "max": 0.021871993278092316
+      },
+      "scale_ratios": {
+        "pred_to_test_deseasonalized": 0.9614397807466475,
+        "pred_to_test_original": 0.9615943555638452,
+        "train_deseasonalized_to_original": 0.9991854802752402,
+        "test_deseasonalized_to_original": 0.9959897022682525
+      }
+    }
+  ]
+}
