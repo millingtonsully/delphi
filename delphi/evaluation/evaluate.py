@@ -668,7 +668,7 @@ def main():
     print("-" * 40)
     for metric, value in metrics.items():
         if isinstance(value, float) and not np.isnan(value):
-            print(f"  {metric.upper():20s}: {value:.4f}")
+            print(f"  {metric.upper():20s}: {value:.8f}")
     
     # Print metric computation statistics
     print("\nMetric Computation Statistics:")
@@ -747,7 +747,7 @@ def main():
         f.write("-" * 50 + "\n")
         for metric, value in metrics.items():
             if isinstance(value, float) and not np.isnan(value):
-                f.write(f"  {metric.upper():20s}: {value:.4f}\n")
+                f.write(f"  {metric.upper():20s}: {value:.8f}\n")
         
         # Add metric computation statistics
         f.write("\n\nMetric Computation Statistics:\n")
