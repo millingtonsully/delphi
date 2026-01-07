@@ -41,7 +41,8 @@ env/
 
 # Large data files
 data/
-checkpoints/
+checkpoints/*.npz
+checkpoints/*.pkl
 
 # Logs
 *.log

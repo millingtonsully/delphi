@@ -19,7 +19,7 @@ class EnsembleMember(nn.Module):
     
     def __init__(
         self,
-        input_dim: int = 3,
+        input_dim: int = 4,
         hidden_size: int = 64,
         num_layers: int = 2,
         output_dim: int = 26,  # Forecast horizon
@@ -80,7 +80,7 @@ class TrendCorrectorRNN(EnsembleMember):
     
     def __init__(
         self,
-        input_dim: int = 3,
+        input_dim: int = 4,
         hidden_size: int = 64,
         num_layers: int = 2,
         output_dim: int = 26,
@@ -100,7 +100,7 @@ class SeasonalityCorrectorRNN(EnsembleMember):
     
     def __init__(
         self,
-        input_dim: int = 3,
+        input_dim: int = 4,
         hidden_size: int = 64,
         num_layers: int = 2,
         output_dim: int = 26,
@@ -120,7 +120,7 @@ class VolatilityShiftCorrectorRNN(EnsembleMember):
     
     def __init__(
         self,
-        input_dim: int = 3,
+        input_dim: int = 4,
         hidden_size: int = 64,
         num_layers: int = 2,
         output_dim: int = 26,
@@ -156,7 +156,7 @@ class ExternalSignalSpecialist(EnsembleMember):
     
     def __init__(
         self,
-        input_dim: int = 3,
+        input_dim: int = 4,
         hidden_size: int = 64,
         num_layers: int = 2,
         output_dim: int = 26,
@@ -203,7 +203,7 @@ class DeepEnsembleCorrectors(nn.Module):
     
     def __init__(
         self,
-        input_dim: int = 3,
+        input_dim: int = 4,
         hidden_size: int = 64,
         num_layers: int = 2,
         output_dim: int = 26,

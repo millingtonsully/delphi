@@ -23,7 +23,7 @@ class DELPHICore(nn.Module):
     
     def __init__(
         self,
-        input_dim: int = 3,  # [z_t, w_t, ŷ_pred_t]
+        input_dim: int = 4,  # [z_t, w_t, ŷ_pred_t, vol_t]
         n_states: int = 4,
         hmm_hidden_size: int = 64,
         hmm_num_layers: int = 2,

@@ -224,7 +224,7 @@ def main():
     
     # Model configuration
     model_config = {
-        'input_dim': 3,
+        'input_dim': 4,
         'n_states': config['hmm']['n_states'],
         'hmm_hidden_size': config['hmm']['hidden_size'],
         'hmm_num_layers': config['hmm']['num_layers'],

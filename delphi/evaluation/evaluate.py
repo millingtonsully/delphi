@@ -185,7 +185,7 @@ def main():
     rng = np.random.default_rng(int(seed))
 
     model_config = {
-        'input_dim': 3,
+        'input_dim': 4,
         'n_states': config['hmm']['n_states'],
         'hmm_hidden_size': config['hmm']['hidden_size'],
         'hmm_num_layers': config['hmm']['num_layers'],
@@ -210,11 +210,13 @@ def main():
     
     # Select subset of series before preprocessing to reduce runtime
     all_series_ids = list(data['main_signal'].keys())
-    # Disable random shuffling so evaluation uses the same deterministic series
-    # ordering as training (first N series). This ensures that when using
-    # training_series_limit=N, evaluation on num_series=N aligns with those
-    # same series.
-    # rng.shuffle(all_series_ids)
+    # Subsample series if requested
+    if args.num_series < len(all_series_ids):
+        # Only shuffle if we are taking a subset (as requested by the user)
+        # This allows 1000 series to be a random representative sample
+        # while 10,000 remains deterministic/sequential.
+        rng.shuffle(all_series_ids)
+    
     selected_ids = all_series_ids[:args.num_series]
     # Note: Selection is currently deterministic (first N series); the seed is
     # reported below for reproducibility/logging only and does not affect which

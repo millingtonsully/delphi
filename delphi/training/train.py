@@ -688,7 +688,7 @@ def main():
         device = requested_device if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     model = DELPHICore(
-        input_dim=3,
+        input_dim=4,
         n_states=config['hmm']['n_states'],
         hmm_hidden_size=config['hmm']['hidden_size'],
         hmm_num_layers=config['hmm']['num_layers'],
