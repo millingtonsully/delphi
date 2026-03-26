@@ -1,4 +1,4 @@
-# DELPHI: Dynamic Ensemble Leveraging Probabilistic Hybrid Inference
+# DELPHI: Dynamic Ensemble Leveraging Probabilistic Hybrid Inference - Fashion Trend Forecasting
 
 A hybrid probabilistic forecasting framework that combines classical statistical models, deep learning ensembles, and latent-state inference to produce robust, interpretable, and uncertainty-aware predictions. Delphi is built specifically to handle the volatility of fashion trends and was trained on publicly available fashion item time series data. 
 
