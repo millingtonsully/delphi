@@ -362,8 +362,7 @@ This project is licensed under the MIT License. See the repository for full lice
 
 ## Contact
 
-millingtonsully@gmail.com
-sullymillington.com
+millingtonsully@gmail.com, [sullymillington.com](https://www.sullymillington.com/)
 
 ---
 
